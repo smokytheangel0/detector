@@ -27,9 +27,9 @@ use super::{
 // --- CONSTANTS ---
 // These are the parameters for the std-based "source_and_calculate"
 #[cfg(debug_assertions)]
-const ITERATIONS: usize = 10_000;
+pub const ITERATIONS: usize = 10_000;
 #[cfg(not(debug_assertions))]
-const ITERATIONS: usize = 1_000_000;
+pub const ITERATIONS: usize = 1_000_000;
 const TOTAL_BITS: usize = ITERATIONS * BIT_WIDTH;
 /// Worst case for runs is alternating bits (e.g., 010), giving N/3 runs.
 /// We'll use N/2 as a safe upper bound.
@@ -259,7 +259,7 @@ fn convert_static_to_std(
         total_runs: static_stats.total_runs,
         total_bits: static_stats.total_bits,
         avg_map,
-        long_ratio: static_stats.long_ratio,
+        long_ratio: static_stats.total_longs_in_runs as f64 / static_stats.total_runs as f64,
         longest: static_stats.longest,
         unique_lengths: static_stats.unique_lengths,
         timings: from_no_std_timings(static_stats.timings), // Use converter

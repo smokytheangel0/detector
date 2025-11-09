@@ -23,10 +23,6 @@ pub enum DetectionType {
     Alternating,
 }
 
-// NOTE: This struct is now hidden from Verus using #[cfg(not(verus))]
-// because Verus cannot parse f64. This struct is only used by
-// std_impl.rs and the tests.
-#[cfg(not(verus))]
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Timings {
     pub collection_start: f64,
@@ -34,13 +30,6 @@ pub struct Timings {
     pub processing_start: f64,
     pub processing_end: Option<f64>,
 }
-
-// NOTE: This is a Verus-visible dummy struct.
-// The real logic in calculate_statistics_static will be marked trusted,
-// so Verus will accept this type mismatch.
-#[cfg(verus)]
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct Timings {}
 
 /// A no_std, static-array-based struct to hold detection results.
 /// `run_counts[i]` stores the count of runs of
@@ -63,20 +52,17 @@ impl<const MAX_LEN: usize> DetectionStatic<MAX_LEN> {
 }
 
 /// A no_std, static-array-based struct for the final statistics.
-// NOTE: This struct is now Verus-visible as f64 has been removed.
 #[derive(Debug, PartialEq)]
 pub struct EntropyStatisticsStatic<const MAX_LEN: usize> {
     pub detection: DetectionStatic<MAX_LEN>,
     /// Total number of bits that are part of a detected run.
     /// e.g., 3 runs of length 5 = 15.
     pub total_runs: u64,
-    /// Total number of bits that were part of a "long" run.
-    pub total_longs_in_runs: u64, // <-- CHANGED FROM long_ratio: f64
     pub total_bits: u64,
+    /// Ratio of (bits in long runs) / (total bits in all runs)
+    pub long_ratio: f64,
     pub longest: u64,
     pub unique_lengths: u64,
-    // NOTE: This field is #[cfg]d. Verus sees the dummy Timings type.
-    // cargo test/build sees the real Timings type.
     pub timings: Timings,
 }
 
@@ -95,114 +81,29 @@ pub enum AnalysisError {
 /// Converts a slice of `u64` into a slice of `bool` (little-endian).
 ///
 /// The caller MUST ensure `all_bits.len() == source.len() * BIT_WIDTH`.
-pub fn ten_to_two_static(source: &[u64], all_bits: &mut [bool]) -> (result: Result<(), AnalysisError>)
-    requires
-        old(all_bits).len() == source.len() * BIT_WIDTH,
-        source.len() < usize::MAX / BIT_WIDTH,
-    ensures
-        // We can't easily express the full functional correctness here without
-        // complex bitvector specs, so we'll leave it simple.
-        // A more complex spec would look like:
-        forall|i: int, j: int| 0 <= i < (source.len() as int) && 0 <= j < (BIT_WIDTH as int) ==>
-             all_bits[i * (BIT_WIDTH as int) + j] === ((source[i] >> j) & 1 == 1)
-{
+pub fn ten_to_two_static(source: &[u64], all_bits: &mut [bool]) -> Result<(), AnalysisError>
+    {
+
+    // --- TODO: KATA Implementation ---
+    // 1. Check if `all_bits.len()` is correct. If not,
+    //    return `Err(AnalysisError::OutputBufferTooSmall)`.
+    // 2. Iterate over `source` with `enumerate()`.
+    // 3. For each `number`, iterate from `bit_index` 0 to `BIT_WIDTH`.
+    // 4. Calculate the write position in `all_bits`.
+    // 5. Write the correct boolean value to `all_bits`.
+    // 6. Return `Ok(())`.
+
+    // Placeholder implementation:
     if all_bits.len() != source.len() * BIT_WIDTH {
         return Err(AnalysisError::OutputBufferTooSmall);
     }
-
-    let mut i = 0;
-    while i < source.len()
-        invariant ({
-            // Hoisted casts
-            let i = i as int;
-            let source_length = source.len() as int;
-            let bit_width = BIT_WIDTH as int;
-
-            // Simple invariants become statements with semicolons
-            0 <= i;
-            i <= source_length;
-
-            // --- FIX: Add preconditions to invariant ---
-            all_bits.len() == source.len() * BIT_WIDTH;
-            source.len() < usize::MAX / BIT_WIDTH;
-            // ------------------------------------------
-
-            // The forall is the final expression (no semicolon)
-            forall|i_prev: int, j: int|
-                0 <= i_prev < i && 0 <= j < bit_width ==>
-                    all_bits[i_prev * bit_width + j] === ((source[i_prev] >> j) & 1 == 1)
-        })
-        decreases source.len() - i
-    {
-        let number = source[i];
-
-        // --- FIX: Removed redundant/incorrect `by` block ---
-        // The loop condition `i < source.len()` already proves this.
-        assert(i < source.len());
-
-        let starting_index = i * BIT_WIDTH;
-
-        let mut bit_index = 0;
-        while bit_index < BIT_WIDTH
-            invariant ({
-                let i_int = i as int; // Use `i_int` to avoid shadowing `i: usize`
-                let bit_index_int = bit_index as int;
-                let source_length_int = source.len() as int;
-                let bit_width_int = BIT_WIDTH as int;
-
-                i < source.len(); // Use `i: usize`
-                0 <= bit_index <= BIT_WIDTH; // Use `bit_index: usize`
-
-                // --- FIX: Add preconditions to invariant ---
-                all_bits.len() == source.len() * BIT_WIDTH;
-                source.len() < usize::MAX / BIT_WIDTH;
-                // ------------------------------------------
-
-                forall|i_prev: int, j: int|
-                    0 <= i_prev < i_int && 0 <= j < bit_width_int ==>
-                        all_bits[i_prev * bit_width_int + j] === ((source[i_prev] >> j) & 1 == 1) &&
-                forall|j_prev: int|
-                    0 <= j_prev < bit_index_int ==>
-                        all_bits[i_int * bit_width_int + j_prev] === ((source[i_int] >> j_prev) & 1 == 1)
-            })
-            decreases (BIT_WIDTH as int) - (bit_index as int)
-        {
-            let write_index = starting_index + bit_index;
-
-            // --- FIX: Corrected the assertions in the `by` block ---
-            assert(write_index < all_bits.len()) by {
-                let i_int = i as int;
-                let bit_index_int = bit_index as int;
-                let source_length_int = source.len() as int;
-                let bit_width_int = BIT_WIDTH as int;
-
-                // Assert facts from invariants (using usize)
-                assert(i < source.len());
-                assert(bit_index < BIT_WIDTH);
-
-                // Assert arithmetic (using int)
-                assert(write_index as int == i_int * bit_width_int + bit_index_int);
-                assert((write_index as int) < (i_int + 1) * bit_width_int); // <-- THIS IS LINE 185
-                assert(i_int + 1 <= source_length_int);
-                assert((i_int + 1) * bit_width_int <= source_length_int * bit_width_int);
-                assert((write_index as int) < source_length_int * bit_width_int);
-
-                // Assert connection to all_bits.len()
-                assert(all_bits.len() as int == source_length_int * bit_width_int);
-                assert((write_index as int) < (all_bits.len() as int));
-                assert(write_index < all_bits.len()); //□
-            };
+    // (Rest of implementation goes here)
+    for source_index in 0..source.len() {
+        let number = source[source_index];
+        let starting_index = source_index * BIT_WIDTH;
+        for bit_index in 0..BIT_WIDTH {
             all_bits[starting_index + bit_index] = (number >> bit_index) & 1 == 1;
-            bit_index += 1;
-
-            assert({
-                let i = i as int;
-                let bit_width = BIT_WIDTH as int;
-                forall|j: int| 0 <= j < bit_width ==>
-                    all_bits[i * bit_width + j] === ((source[i] >> j) & 1 ==1)
-            });
         }
-        i += 1;
     }
     Ok(())
 }
@@ -224,25 +125,30 @@ pub fn detect_static<'a>(
     bits: &'a [bool],
     detection_type: DetectionType,
     runs_buffer: &'a mut [u64],
-) -> (result: Result<usize, AnalysisError>)
-    ensures
-        match result {
-            Ok(run_count) => run_count <= runs_buffer.len(),
-            Err(_) => true,
-        }
-{
+) -> Result<usize, AnalysisError> {
+    // --- TODO: KATA Implementation ---
+    // 1. Initialize `last_bit: Option<bool> = None`, `length: u64 = 0`, `run_count: usize = 0`.
+    // 2. Iterate over `bits`.
+    // 3. Use `if let Some(last) = last_bit` to handle the first bit vs. subsequent bits.
+    // 4. If `pattern_detected` is true, increment `length`.
+    // 5. If `pattern_detected` is false (a run is broken):
+    //    a. Check if `length > 2`.
+    //    b. If so, check if `run_count < runs_buffer.len()`. If it's not,
+    //       return `Err(AnalysisError::OutputBufferTooSmall)`.
+    //    c. Write `length` to `runs_buffer[run_count]`.
+    //    d. Increment `run_count`.
+    //    e. Reset `length = 1`.
+    // 6. Don't forget to update `last_bit = Some(*bit)` at the end of each loop.
+    // 7. After the loop, handle the final run (in case the data ends mid-run)
+    //    with the same logic as step 5.
+    // 8. Return `Ok(run_count)`.
+
+    // Placeholder implementation:
     let mut last_bit: Option<bool> = None;
     let mut length: u64 = 0;
     let mut run_count: usize = 0;
 
-    let mut position = 0;
-    while position < bits.len()
-        invariant
-            0 <= position <= bits.len(),
-            run_count <= runs_buffer.len(),
-            length <= bits.len() as u64, // <-- FIX: Prove `length` doesn't overflow
-        decreases bits.len() - position
-    {
+    for position in 0..bits.len() {
         let bit = bits[position];
         if let Some(last) = last_bit {
             if pattern_detected(detection_type, bit, last) {
@@ -263,7 +169,6 @@ pub fn detect_static<'a>(
             length = 1;
         }
         last_bit = Some(bit);
-        position += 1;
     }
 
     // Handle last run
@@ -282,117 +187,109 @@ pub fn detect_static<'a>(
 pub fn tally_lengths_static<const MAX_LEN: usize>(
     runs: &[u64], // Slice of run lengths, e.g., [5, 3, 5]
     run_counts: &mut [u64; MAX_LEN],
-) -> (result: Result<(), AnalysisError>)
-    requires
-        MAX_LEN > 0,
-    ensures
-        // A full spec would capture the relationship between `runs` and `run_counts`
-        true,
-{
-    let mut run_index = 0;
-    while run_index < runs.len()
-        invariant 0 <= run_index <= runs.len(),
-        decreases runs.len() - run_index
-    {
+) -> Result<(), AnalysisError> {
+    // --- TODO: KATA Implementation ---
+    // 1. Iterate over the `runs` slice (which only contains lengths > 2).
+    // 2. For each `length`, check `if length == 0`, and `continue` if so.
+    // 3. Convert `length` to `usize`.
+    // 4. Check if `len_idx >= MAX_LEN`. If so,
+    //    return `Err(AnalysisError::RunLengthTooLong)`.
+    // 5. Increment `run_counts[len_idx]`.
+    // 6. Return `Ok(())`.
+
+    // Placeholder implementation:
+    for run_index in 0..runs.len() {
         let length = runs[run_index];
-        if length > 0 { // Only tally non-zero lengths
-            if length >= (MAX_LEN as u64) {
-                return Err(AnalysisError::RunLengthTooLong);
-            }
-            // Proof context: We know len_idx is in bounds
-            assume(length < MAX_LEN);
-
-            // --- FIX: Assume count doesn't overflow ---
-            assume(run_counts[length as int] < u64::MAX);
-            // ------------------------------------------
-
-            run_counts[length as usize] += 1;
+        if length == 0 {
+            continue;
         }
-        run_index += 1;
+        let len_idx = length as usize;
+        if len_idx >= MAX_LEN {
+            return Err(AnalysisError::RunLengthTooLong);
+        }
+        run_counts[len_idx] += 1;
     }
     Ok(())
 }
 
 /// Calculates final statistics from the tallied run counts.
-// NOTE: This function is marked as trusted because it interacts with
-// the #[cfg]d `Timings` struct, which Verus sees as a dummy type.
-// The logic itself is verifiable, but the type mismatch forces
-// us to trust this function.
-#[verus::trusted]
 pub fn calculate_statistics_static<const MAX_LEN: usize>(
     total_bits: u64,
     long_threshold: u64,
     detection: DetectionStatic<MAX_LEN>,
     timings: Timings,
-) -> EntropyStatisticsStatic<MAX_LEN>
-    requires
-        MAX_LEN > 0,
-{
+) -> EntropyStatisticsStatic<MAX_LEN> {
+    // --- TODO: KATA Implementation ---
+    // 1. Initialize `total_runs = 0`, `total_longs = 0`, `unique_lengths = 0`, `longest = 0`.
+    // 2. Iterate over `detection.run_counts.iter().enumerate()`.
+    // 3. If `count > 0`:
+    //    a. Get `length = length_idx as u64`.
+    //    b. `total_runs += length * count`.
+    //    c. `unique_lengths += 1`.
+    //    d. Check if `length > long_threshold` and update `total_longs`.
+    //    e. Check if `length > longest` and update `longest`.
+    // 4. Calculate `long_ratio` (check for `total_runs > 0` to avoid divide by zero).
+    // 5. Return the populated `EntropyStatisticsStatic` struct.
+
+    // Placeholder implementation:
     let mut total_runs: u64 = 0;
     let mut total_longs: u64 = 0;
     let mut unique_lengths: u64 = 0;
     let mut longest: u64 = 0;
 
-    let mut length_index = 0;
-    while length_index < MAX_LEN
-        invariant 0 <= length_index <= MAX_LEN,
-        decreases MAX_LEN - length_index
-    {
-        // Proof context: length_index is in bounds
-        assume(length_index < MAX_LEN);
+    for length_index in 0..detection.run_counts.len() {
         let count = detection.run_counts[length_index];
         if count > 0 {
             let length = length_index as u64;
-
-            // --- FIX: Assume arithmetic doesn't overflow ---
-            assume(count == 0 || length < u64::MAX / count);
             let run_total_bits = length * count;
-
-            assume(total_runs < u64::MAX - run_total_bits);
             total_runs += run_total_bits;
-
-            assume(unique_lengths < u64::MAX);
             unique_lengths += 1;
-            // ---------------------------------------------
 
             if length > long_threshold {
-                // --- FIX: Assume arithmetic doesn't overflow ---
-                assume(total_longs < u64::MAX - run_total_bits);
-                // ---------------------------------------------
                 total_longs += run_total_bits;
             }
             if length > longest {
                 longest = length;
             }
         }
-        length_index += 1;
     }
 
-    // REMOVED float calculation.
-    // let long_ratio = if total_runs > 0 {
-    //     convert_u64_to_f64(total_longs, total_runs) // <-- This call is removed
-    // } else {
-    //     0.0
-    // };
+    let long_ratio = if total_runs > 0 {
+        convert_u64_to_f64(total_longs, total_runs)
+    } else {
+        0.0
+    };
 
     EntropyStatisticsStatic {
         detection,
         total_runs,
-        total_longs_in_runs: total_longs, // <-- Store the integer numerator
         total_bits,
-        // long_ratio, // <-- This field is removed
+        long_ratio,
         longest,
         unique_lengths,
         timings,
     }
 }
 
-// DELETED the convert_u64_to_f64 function as it's no longer used here.
+#[verus::trusted]
+fn convert_u64_to_f64(longs: u64, runs: u64) -> (res: f64) {
+    // This 'real' implementation is only compiled by `cargo build`
+    // and is hidden from Verus.
+    #[cfg(not(verus))]
+    let res = longs as f64 / runs as f64;
+
+    // This 'dummy' implementation is all Verus's frontend sees.
+    // Since the whole function is #[verus::trusted], Verus
+    // doesn't check if 0.0 is the "correct" value.
+    #[cfg(verus)]
+    let res = 0.0;
+
+    res
+}
 
 // --- KATA TEST SUITE ---
 // These tests are `no_std` and use only static arrays.
-// NOTE: The entire test module is hidden from Verus.
-#[cfg(not(verus))]
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -483,12 +380,9 @@ mod tests {
         assert_eq!(stats.longest, 8);
         // total_runs = (3 runs * 3 bits) + (5 runs * 8 bits) = 9 + 40 = 49
         assert_eq!(stats.total_runs, 49);
-
-        // --- MODIFIED TEST ---
         // total_longs (runs > 5) = (5 runs * 8 bits) = 40
-        // Check the integer field instead of the float ratio
-        assert_eq!(stats.total_longs_in_runs, 40);
-        // assert_eq!(stats.long_ratio, 40.0 / 49.0); // This assertion is removed
+        // long_ratio = 40 / 49
+        assert_eq!(stats.long_ratio, 40.0 / 49.0);
     }
 
     // --- Unit Tests (Adapted from your originals) ---
