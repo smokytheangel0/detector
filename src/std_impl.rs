@@ -26,6 +26,9 @@ use super::{
 
 // --- CONSTANTS ---
 // These are the parameters for the std-based "source_and_calculate"
+#[cfg(debug_assertions)]
+const ITERATIONS: usize = 10_000;
+#[cfg(not(debug_assertions))]
 const ITERATIONS: usize = 1_000_000;
 const TOTAL_BITS: usize = ITERATIONS * BIT_WIDTH;
 /// Worst case for runs is alternating bits (e.g., 010), giving N/3 runs.
@@ -35,8 +38,10 @@ const MAX_RUNS_BUFFER: usize = TOTAL_BITS / 2;
 /// slot so `[TOTAL_BITS]` is a valid index.
 const MAX_TALLY_LEN: usize = TOTAL_BITS + 1;
 // Set stack size to 128 MiB (1024 * 1024 * 1024)
-const THREAD_STACK_SIZE: usize = 1024 * 1024 * 10248;
-
+#[cfg(not(debug_assertions))]
+const THREAD_STACK_SIZE: usize = 1024 * 1024 * 1024;
+#[cfg(debug_assertions)]
+const THREAD_STACK_SIZE: usize = 16 * 1024 * 1024;
 // --- Serde-based (std) Structs for JSON ---
 
 // --- NEW std-specific, serializable enums/structs ---

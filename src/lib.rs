@@ -277,7 +277,7 @@ mod tests {
     fn test_kata_static_analysis_pipeline() {
         // --- 1. Setup ---
         // Our "random" data source
-        let source_data: [u64; 2] = [
+        const source_data: [u64; 2] = [
             0b10101010_000_11111_00000_101_111_01010101_00110011_11110000_10101010, // 64 bits
             0b01010101_111_000_111_010_111_1111111_000_111_000_10101010_00001111,   // 64 bits
         ];
