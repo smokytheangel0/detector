@@ -9,7 +9,9 @@ serde = { version = "1.0", default-features = false, features = ["derive"], opti
 serde_json = { version = "1.0", default-features = false, optional = true }
 rand_core = { version = "0.6", default-features = false, optional = true }
 proptest = "1.9.0"
-
+vstd = "0.0.0-2025-11-09-0048"
+verus_builtin = "0.0.0-2025-08-12-1837"
+verus_builtin_macros = "0.0.0-2025-11-09-0048"
 [features]
 # This "std" feature flag enables all the std-dependent crates and features
 default = []

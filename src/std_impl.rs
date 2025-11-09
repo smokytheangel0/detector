@@ -41,7 +41,7 @@ const MAX_TALLY_LEN: usize = TOTAL_BITS + 1;
 #[cfg(not(debug_assertions))]
 const THREAD_STACK_SIZE: usize = 1024 * 1024 * 1024;
 #[cfg(debug_assertions)]
-const THREAD_STACK_SIZE: usize = 16 * 1024 * 1024;
+const THREAD_STACK_SIZE: usize = 8 * 1024 * 1024;
 // --- Serde-based (std) Structs for JSON ---
 
 // --- NEW std-specific, serializable enums/structs ---
@@ -63,7 +63,8 @@ pub struct Timings {
 }
 
 // --- NEW Converter functions ---
-
+//should do this conversion in std_impl only, then we can alias it in there,
+//and keep these names clean, and have the deserialization only in std_impl
 fn to_no_std_detection_type(std_type: DetectionType) -> NoStdDetectionType {
     match std_type {
         DetectionType::Zeros => NoStdDetectionType::Zeros,

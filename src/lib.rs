@@ -1,6 +1,7 @@
 #![cfg_attr(not(feature = "std"), no_std)]
 #![doc = "A no_std, allocation-free library for detecting bit-run entropy."]
-
+use vstd::prelude::*;
+verus! {
 // --- Add this line ---
 // This conditionally includes the std_impl.rs file ONLY
 // when the "std" feature is enabled in Cargo.toml.
@@ -480,4 +481,4 @@ mod tests {
         assert_eq!(result, Err(AnalysisError::RunLengthTooLong));
     }
 }
-
+}

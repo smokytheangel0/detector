@@ -1,0 +1,1 @@
+core::iter::Enumerate<core::slice::Iter<'_, u64>>: vstd::pervasive::ForLoopGhostIteratorNew
