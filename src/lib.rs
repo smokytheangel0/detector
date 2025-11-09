@@ -1,0 +1,483 @@
+#![cfg_attr(not(feature = "std"), no_std)]
+#![doc = "A no_std, allocation-free library for detecting bit-run entropy."]
+
+// --- Add this line ---
+// This conditionally includes the std_impl.rs file ONLY
+// when the "std" feature is enabled in Cargo.toml.
+#[cfg(feature = "std")]
+pub mod std_impl;
+// -------------------
+
+// --- Constants ---
+
+/// The bit-width of the source integers.
+pub const BIT_WIDTH: usize = 64;
+
+// --- Public Structs & Enums (no_std) ---
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum DetectionType {
+    Zeros,
+    Ones,
+    Alternating,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Timings {
+    pub collection_start: f64,
+    pub collection_end: f64,
+    pub processing_start: f64,
+    pub processing_end: Option<f64>,
+}
+
+/// A no_std, static-array-based struct to hold detection results.
+/// `run_counts[i]` stores the count of runs of
+#[derive(Debug, PartialEq, Eq)]
+pub struct DetectionStatic<const MAX_LEN: usize> {
+    /// `run_counts[i]` holds the count of runs of length `i`.
+    /// `run_counts[0]` is unused.
+    pub run_counts: [u64; MAX_LEN],
+    pub detection_type: DetectionType,
+}
+
+impl<const MAX_LEN: usize> DetectionStatic<MAX_LEN> {
+    /// Creates a new, zeroed DetectionStatic store.
+    pub fn new(detection_type: DetectionType) -> Self {
+        Self {
+            run_counts: [0; MAX_LEN],
+            detection_type,
+        }
+    }
+}
+
+/// A no_std, static-array-based struct for the final statistics.
+#[derive(Debug, PartialEq)]
+pub struct EntropyStatisticsStatic<const MAX_LEN: usize> {
+    pub detection: DetectionStatic<MAX_LEN>,
+    /// Total number of bits that are part of a detected run.
+    /// e.g., 3 runs of length 5 = 15.
+    pub total_runs: u64,
+    pub total_bits: u64,
+    /// Ratio of (bits in long runs) / (total bits in all runs)
+    pub long_ratio: f64,
+    pub longest: u64,
+    pub unique_lengths: u64,
+    pub timings: Timings,
+}
+
+/// Errors that can occur during static analysis.
+#[derive(Debug, PartialEq, Eq)]
+pub enum AnalysisError {
+    /// The provided output buffer is too small for the result.
+    OutputBufferTooSmall,
+    /// A detected run length exceeds the size of the tallying array.
+    RunLengthTooLong,
+}
+
+// --- Pure, no_std Analysis Functions ---
+// These are the functions you will implement for the kata.
+
+/// Converts a slice of `u64` into a slice of `bool` (little-endian).
+///
+/// The caller MUST ensure `all_bits.len() == source.len() * BIT_WIDTH`.
+pub fn ten_to_two_static(source: &[u64], all_bits: &mut [bool]) -> Result<(), AnalysisError> {
+    // --- TODO: KATA Implementation ---
+    // 1. Check if `all_bits.len()` is correct. If not,
+    //    return `Err(AnalysisError::OutputBufferTooSmall)`.
+    // 2. Iterate over `source` with `enumerate()`.
+    // 3. For each `number`, iterate from `bit_index` 0 to `BIT_WIDTH`.
+    // 4. Calculate the write position in `all_bits`.
+    // 5. Write the correct boolean value to `all_bits`.
+    // 6. Return `Ok(())`.
+
+    // Placeholder implementation:
+    if all_bits.len() != source.len() * BIT_WIDTH {
+        return Err(AnalysisError::OutputBufferTooSmall);
+    }
+    // (Rest of implementation goes here)
+    for (source_index, number) in source.iter().enumerate() {
+        let starting_index = source_index * BIT_WIDTH;
+        for bit_index in 0..BIT_WIDTH {
+            all_bits[starting_index + bit_index] = (number >> bit_index) & 1 == 1;
+        }
+    }
+    Ok(())
+}
+
+/// Helper function to check for the run pattern.
+fn pattern_detected(detection_type: DetectionType, bit: bool, last_bit: bool) -> bool {
+    match detection_type {
+        DetectionType::Alternating => bit != last_bit,
+        DetectionType::Ones => bit && last_bit,
+        DetectionType::Zeros => !bit && !last_bit,
+    }
+}
+
+/// Detects runs of a given type in a slice of `bool`.
+///
+/// Writes all run lengths > 2 into `runs_buffer` and returns the
+/// total number of runs found (`run_count`).
+pub fn detect_static<'a>(
+    bits: &'a [bool],
+    detection_type: DetectionType,
+    runs_buffer: &'a mut [u64],
+) -> Result<usize, AnalysisError> {
+    // --- TODO: KATA Implementation ---
+    // 1. Initialize `last_bit: Option<bool> = None`, `length: u64 = 0`, `run_count: usize = 0`.
+    // 2. Iterate over `bits`.
+    // 3. Use `if let Some(last) = last_bit` to handle the first bit vs. subsequent bits.
+    // 4. If `pattern_detected` is true, increment `length`.
+    // 5. If `pattern_detected` is false (a run is broken):
+    //    a. Check if `length > 2`.
+    //    b. If so, check if `run_count < runs_buffer.len()`. If it's not,
+    //       return `Err(AnalysisError::OutputBufferTooSmall)`.
+    //    c. Write `length` to `runs_buffer[run_count]`.
+    //    d. Increment `run_count`.
+    //    e. Reset `length = 1`.
+    // 6. Don't forget to update `last_bit = Some(*bit)` at the end of each loop.
+    // 7. After the loop, handle the final run (in case the data ends mid-run)
+    //    with the same logic as step 5.
+    // 8. Return `Ok(run_count)`.
+
+    // Placeholder implementation:
+    let mut last_bit: Option<bool> = None;
+    let mut length: u64 = 0;
+    let mut run_count: usize = 0;
+
+    for bit in bits {
+        if let Some(last) = last_bit {
+            if pattern_detected(detection_type, *bit, last) {
+                length += 1;
+            } else {
+                // Run broken
+                if length > 2 {
+                    if run_count >= runs_buffer.len() {
+                        return Err(AnalysisError::OutputBufferTooSmall);
+                    }
+                    runs_buffer[run_count] = length;
+                    run_count += 1;
+                }
+                length = 1;
+            }
+        } else {
+            // First bit
+            length = 1;
+        }
+        last_bit = Some(*bit);
+    }
+
+    // Handle last run
+    if length > 2 {
+        if run_count >= runs_buffer.len() {
+            return Err(AnalysisError::OutputBufferTooSmall);
+        }
+        runs_buffer[run_count] = length;
+        run_count += 1;
+    }
+
+    Ok(run_count)
+}
+
+/// Tallies run lengths from a slice `runs` into a fixed-size array `run_counts`.
+pub fn tally_lengths_static<const MAX_LEN: usize>(
+    runs: &[u64], // Slice of run lengths, e.g., [5, 3, 5]
+    run_counts: &mut [u64; MAX_LEN],
+) -> Result<(), AnalysisError> {
+    // --- TODO: KATA Implementation ---
+    // 1. Iterate over the `runs` slice (which only contains lengths > 2).
+    // 2. For each `length`, check `if length == 0`, and `continue` if so.
+    // 3. Convert `length` to `usize`.
+    // 4. Check if `len_idx >= MAX_LEN`. If so,
+    //    return `Err(AnalysisError::RunLengthTooLong)`.
+    // 5. Increment `run_counts[len_idx]`.
+    // 6. Return `Ok(())`.
+
+    // Placeholder implementation:
+    for &length in runs {
+        if length == 0 {
+            continue;
+        }
+        let len_idx = length as usize;
+        if len_idx >= MAX_LEN {
+            return Err(AnalysisError::RunLengthTooLong);
+        }
+        run_counts[len_idx] += 1;
+    }
+    Ok(())
+}
+
+/// Calculates final statistics from the tallied run counts.
+pub fn calculate_statistics_static<const MAX_LEN: usize>(
+    total_bits: u64,
+    long_threshold: u64,
+    detection: DetectionStatic<MAX_LEN>,
+    timings: Timings,
+) -> EntropyStatisticsStatic<MAX_LEN> {
+    // --- TODO: KATA Implementation ---
+    // 1. Initialize `total_runs = 0`, `total_longs = 0`, `unique_lengths = 0`, `longest = 0`.
+    // 2. Iterate over `detection.run_counts.iter().enumerate()`.
+    // 3. If `count > 0`:
+    //    a. Get `length = length_idx as u64`.
+    //    b. `total_runs += length * count`.
+    //    c. `unique_lengths += 1`.
+    //    d. Check if `length > long_threshold` and update `total_longs`.
+    //    e. Check if `length > longest` and update `longest`.
+    // 4. Calculate `long_ratio` (check for `total_runs > 0` to avoid divide by zero).
+    // 5. Return the populated `EntropyStatisticsStatic` struct.
+
+    // Placeholder implementation:
+    let mut total_runs: u64 = 0;
+    let mut total_longs: u64 = 0;
+    let mut unique_lengths: u64 = 0;
+    let mut longest: u64 = 0;
+
+    for (length_idx, &count) in detection.run_counts.iter().enumerate() {
+        if count > 0 {
+            let length = length_idx as u64;
+            let run_total_bits = length * count;
+            total_runs += run_total_bits;
+            unique_lengths += 1;
+
+            if length > long_threshold {
+                total_longs += run_total_bits;
+            }
+            if length > longest {
+                longest = length;
+            }
+        }
+    }
+
+    let long_ratio = if total_runs > 0 {
+        total_longs as f64 / total_runs as f64
+    } else {
+        0.0
+    };
+
+    EntropyStatisticsStatic {
+        detection,
+        total_runs,
+        total_bits,
+        long_ratio,
+        longest,
+        unique_lengths,
+        timings,
+    }
+}
+
+// --- KATA TEST SUITE ---
+// These tests are `no_std` and use only static arrays.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// This is the primary kata. Make this test pass by implementing
+    /// the four `_static` functions above.
+    #[test]
+    fn test_kata_static_analysis_pipeline() {
+        // --- 1. Setup ---
+        // Our "random" data source
+        let source_data: [u64; 2] = [
+            0b10101010_000_11111_00000_101_111_01010101_00110011_11110000_10101010, // 64 bits
+            0b01010101_111_000_111_010_111_1111111_000_111_000_10101010_00001111,   // 64 bits
+        ];
+        const TOTAL_BITS: usize = BIT_WIDTH * source_data.len(); // 128
+        const MAX_TEST_RUNS: usize = TOTAL_BITS / 2; // 64
+        const MAX_TEST_LEN: usize = TOTAL_BITS + 1; // 129
+
+        // Buffers that live on the stack
+        let mut bit_buffer: [bool; TOTAL_BITS] = [false; TOTAL_BITS];
+        let mut runs_buffer: [u64; MAX_TEST_RUNS] = [0; MAX_TEST_RUNS];
+        let mut detection_store = DetectionStatic::<MAX_TEST_LEN>::new(DetectionType::Alternating);
+
+        let dummy_timings = Timings {
+            collection_start: 0.0,
+            collection_end: 0.0,
+            processing_start: 0.0,
+            processing_end: None,
+        };
+
+        // --- 2. ten_to_two ---
+        ten_to_two_static(&source_data, &mut bit_buffer).expect("ten_to_two failed");
+
+        // Check a few key bits (little-endian)
+        // 0b...10101010
+        assert_eq!(bit_buffer[0], false);
+        assert_eq!(bit_buffer[1], true);
+        assert_eq!(bit_buffer[2], false);
+        // 0b01010101... (at index 64)
+        assert_eq!(bit_buffer[64], true);
+        assert_eq!(bit_buffer[65], false);
+        assert_eq!(bit_buffer[66], true);
+
+        // --- 3. detect ---
+        // We are detecting ALTERNATING runs.
+        let run_count = detect_static(&bit_buffer, DetectionType::Alternating, &mut runs_buffer)
+            .expect("detect failed");
+
+        // The runs in `source_data` are:
+        // 1. 10101010 (len 8)
+        // 2. 101 (len 3)
+        // 3. 01010101 (len 8)
+        // 4. 10101010 (len 8)
+        // 5. 01010101 (len 8)
+        // 6. 010 (len 3)
+        // 7. 101 (len 3)
+        // 8. 10101010 (len 8)
+        // Total: 8 runs
+        assert_eq!(run_count, 8);
+
+        let found_runs = &runs_buffer[0..run_count];
+        // Note: The order depends on your exact loop implementation,
+        // but the counts should be the same.
+        // Let's sort to make the test stable.
+        let mut sorted_runs = [0u64; 8];
+        sorted_runs.copy_from_slice(&runs_buffer[0..8]);
+        sorted_runs.sort();
+
+        let expected_runs: [u64; 8] = [3, 3, 3, 8, 8, 8, 8, 8];
+        assert_eq!(sorted_runs, expected_runs);
+
+        // --- 4. tally ---
+        tally_lengths_static(found_runs, &mut detection_store.run_counts).expect("tally failed");
+
+        assert_eq!(detection_store.run_counts[3], 3); // 3 runs of length 3
+        assert_eq!(detection_store.run_counts[8], 5); // 5 runs of length 8
+        assert_eq!(detection_store.run_counts[5], 0); // 0 runs of length 5
+
+        // --- 5. calculate ---
+        let stats = calculate_statistics_static(
+            TOTAL_BITS as u64,
+            5, // long_threshold
+            detection_store,
+            dummy_timings,
+        );
+
+        assert_eq!(stats.unique_lengths, 2); // Lengths 3 and 8
+        assert_eq!(stats.longest, 8);
+        // total_runs = (3 runs * 3 bits) + (5 runs * 8 bits) = 9 + 40 = 49
+        assert_eq!(stats.total_runs, 49);
+        // total_longs (runs > 5) = (5 runs * 8 bits) = 40
+        // long_ratio = 40 / 49
+        assert_eq!(stats.long_ratio, 40.0 / 49.0);
+    }
+
+    // --- Unit Tests (Adapted from your originals) ---
+
+    #[test]
+    fn test_ten_to_two_static_simple() {
+        let number: [u64; 1] = [42]; // 42 = 0b101010
+        let mut bits: [bool; BIT_WIDTH * 1] = [false; BIT_WIDTH * 1];
+        ten_to_two_static(&number, &mut bits).unwrap();
+
+        let mut expected_bits = [false; BIT_WIDTH];
+        expected_bits[1] = true; // 2^1
+        expected_bits[3] = true; // 2^3
+        expected_bits[5] = true; // 2^5
+        assert_eq!(bits, expected_bits);
+    }
+
+    #[test]
+    fn test_ten_to_two_static_fail_small_buffer() {
+        let number: [u64; 1] = [42];
+        let mut bits: [bool; 10] = [false; 10]; // Too small
+        let result = ten_to_two_static(&number, &mut bits);
+        assert_eq!(result, Err(AnalysisError::OutputBufferTooSmall));
+    }
+
+    #[test]
+    fn test_detect_alternating_runs() {
+        // [T, F, T, F, T,  T, T, T, T, F, T, F, T]
+        let input_data: [bool; 13] = [
+            true, false, true, false, true, // Run 1 (len 5)
+            true, true, true, true, // Not alternating
+            false, true, false, true, // Run 2 (len 4)
+        ];
+        let mut runs_buffer: [u64; 5] = [0; 5];
+        let run_count =
+            detect_static(&input_data, DetectionType::Alternating, &mut runs_buffer).unwrap();
+
+        assert_eq!(run_count, 2);
+        assert_eq!(runs_buffer[0], 5);
+        assert_eq!(runs_buffer[1], 4);
+    }
+
+    #[test]
+    fn test_detect_ones_runs() {
+        // [T, T, T,  F, F,  T, T, T, T,  F, T]
+        let input_data: [bool; 11] = [
+            true, true, true, // Run 1 (len 3)
+            false, false, true, true, true, true, // Run 2 (len 4)
+            false, true,
+        ];
+        let mut runs_buffer: [u64; 5] = [0; 5];
+        let run_count = detect_static(&input_data, DetectionType::Ones, &mut runs_buffer).unwrap();
+
+        assert_eq!(run_count, 2);
+        assert_eq!(runs_buffer[0], 3);
+        assert_eq!(runs_buffer[1], 4);
+    }
+
+    #[test]
+    fn test_detect_zeros_runs() {
+        // [T,  F, F, F,  T, T,  F, F, F, F, F]
+        let input_data: [bool; 11] = [
+            true, false, false, false, // Run 1 (len 3)
+            true, true, false, false, false, false, false, // Run 2 (len 5)
+        ];
+        let mut runs_buffer: [u64; 5] = [0; 5];
+        let run_count = detect_static(&input_data, DetectionType::Zeros, &mut runs_buffer).unwrap();
+
+        assert_eq!(run_count, 2);
+        assert_eq!(runs_buffer[0], 3);
+        assert_eq!(runs_buffer[1], 5);
+    }
+
+    #[test]
+    fn test_detect_no_runs() {
+        let input_data = [false, false, true, true, false, true, false, true];
+        let mut runs_buffer: [u64; 5] = [0; 5];
+        let run_count = detect_static(&input_data, DetectionType::Zeros, &mut runs_buffer).unwrap();
+        // No runs are > 2
+        assert_eq!(run_count, 0);
+    }
+
+    #[test]
+    fn test_detect_fail_small_buffer() {
+        // Contains 3 runs of 3
+        let input_data = [
+            true, true, true, false, true, true, true, false, true, true, true,
+        ];
+        let mut runs_buffer: [u64; 2] = [0; 2]; // Only space for 2
+        let result = detect_static(&input_data, DetectionType::Ones, &mut runs_buffer);
+        // Fails on the 3rd run
+        assert_eq!(result, Err(AnalysisError::OutputBufferTooSmall));
+    }
+
+    #[test]
+    fn test_tally_runs() {
+        const MAX_LEN: usize = 11;
+        let detection_result: [u64; 7] = [5, 3, 6, 5, 8, 8, 10];
+        let mut run_counts: [u64; MAX_LEN] = [0; MAX_LEN];
+
+        tally_lengths_static(&detection_result, &mut run_counts).unwrap();
+
+        assert_eq!(run_counts[3], 1);
+        assert_eq!(run_counts[5], 2);
+        assert_eq!(run_counts[6], 1);
+        assert_eq!(run_counts[8], 2);
+        assert_eq!(run_counts[10], 1);
+        assert_eq!(run_counts[2], 0);
+    }
+
+    #[test]
+    fn test_tally_fail_run_too_long() {
+        const MAX_LEN: usize = 10;
+        let detection_result: [u64; 1] = [10]; // Length 10 is >= MAX_LEN (idx 10)
+        let mut run_counts: [u64; MAX_LEN] = [0; MAX_LEN];
+
+        let result = tally_lengths_static(&detection_result, &mut run_counts);
+        assert_eq!(result, Err(AnalysisError::RunLengthTooLong));
+    }
+}
+

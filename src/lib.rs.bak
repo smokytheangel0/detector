@@ -1,0 +1,766 @@
+use std::collections::HashMap;
+use std::fs::File;
+use std::io::{Read, Write};
+use std::sync::{Arc, OnceLock};
+use std::thread;
+use std::time::{SystemTime, UNIX_EPOCH};
+extern crate serde;
+extern crate serde_json;
+use rand_core::{OsRng, TryRngCore};
+use serde::{Deserialize, Serialize};
+
+//70 expect!, 4 unwrap!, 22 vec!
+static HISTORY: OnceLock<History> = OnceLock::new();
+
+#[derive(Debug)]
+struct History {
+    zero_counts: HashMap<u64, u64>,
+    one_counts: HashMap<u64, u64>,
+    alternating_counts: HashMap<u64, u64>,
+    total: u64,
+}
+
+/// This should be called on app start
+pub fn get_history() {
+    let file = match File::options().read(true).open("sequence_history.json") {
+        Ok(file) => Some(file),
+        Err(_) => {
+            HISTORY.get_or_init(|| History {
+                zero_counts: HashMap::new(),
+                one_counts: HashMap::new(),
+                alternating_counts: HashMap::new(),
+                total: 0,
+            });
+            None
+        }
+    };
+
+    if let Some(mut file) = file {
+        let mut file_contents = String::new();
+        file.read_to_string(&mut file_contents)
+            .expect("failed to read from sequence_history.csv");
+
+        let mut total = 0;
+        let mut zero_counts: HashMap<u64, u64> = HashMap::new();
+        let mut one_counts: HashMap<u64, u64> = HashMap::new();
+        let mut alternating_counts: HashMap<u64, u64> = HashMap::new();
+
+        for (line_number, line) in file_contents.split("\n").enumerate() {
+            if line.is_empty() {
+                continue;
+            }
+            let statistics: EntropyStatistics = serde_json::from_str(line).unwrap_or_else(|_| {
+                panic!(
+                    "failed to read line {} from sequence_history.csv",
+                    line_number
+                )
+            });
+
+            total += statistics.total_bits;
+            for length in statistics.detection.run_count.keys() {
+                match statistics.detection.detection_type {
+                    DetectionType::Zeros => {
+                        if let Some(old_count) =
+                            zero_counts.insert(
+                                *length,
+                                *statistics.detection.run_count.get(length).expect(
+                                    "run_count from sequence_history had a key with no value",
+                                ),
+                            )
+                        {
+                            zero_counts.insert(
+                                *length,
+                                *statistics.detection.run_count.get(length).expect(
+                                    "run_count from sequence_history had a key with no value",
+                                ) + old_count,
+                            );
+                        };
+                    }
+                    DetectionType::Ones => {
+                        if let Some(old_count) =
+                            one_counts.insert(
+                                *length,
+                                *statistics.detection.run_count.get(length).expect(
+                                    "run_count from sequence_history had a key with no value",
+                                ),
+                            )
+                        {
+                            one_counts.insert(
+                                *length,
+                                *statistics.detection.run_count.get(length).expect(
+                                    "run_count from sequence_history had a key with no value",
+                                ) + old_count,
+                            );
+                        };
+                    }
+                    DetectionType::Alternating => {
+                        if let Some(old_count) =
+                            alternating_counts.insert(
+                                *length,
+                                *statistics.detection.run_count.get(length).expect(
+                                    "run_count from sequence_history had a key with no value",
+                                ),
+                            )
+                        {
+                            alternating_counts.insert(
+                                *length,
+                                *statistics.detection.run_count.get(length).expect(
+                                    "run_count from sequence_history had a key with no value",
+                                ) + old_count,
+                            );
+                        };
+                    }
+                }
+            }
+        }
+        HISTORY.get_or_init(|| History {
+            zero_counts,
+            one_counts,
+            alternating_counts,
+            total,
+        });
+    }
+}
+
+//we get a stack overflow from cargo test, so our math must be off
+//once we get that right, this seems to be a good demo for arrays
+const BIT_WIDTH: usize = 64; //could also use usize::BITS, but everything else is hardwired 64bit
+//the output array must be the size of the source * 64
+//in the source the bits are arranged as 64 bit integers
+//so integer at position [4] in the array actually starts at
+//bit number 256?
+//[
+//i =   0->0000000000000000000000000000000000000000000000000000000000000001<-63
+//i =  64->0000000000000000000000000000000000000000000000000000000000000010<-127
+//i = 128->0000000000000000000000000000000000000000000000000000000000000011<-191
+//] ==
+//[i = 0, 1  2
+//     v  v  v
+//     1, 2, 3
+//]
+// so according to that model we have this vvv
+const NUMBER_OF_ELEMENTS: usize = BIT_WIDTH * ITERATIONS;
+fn ten_to_two(source: &[u64; ITERATIONS]) -> [bool; NUMBER_OF_ELEMENTS] {
+    let mut all_bits: [bool; NUMBER_OF_ELEMENTS] = [false; NUMBER_OF_ELEMENTS];
+    for (source_index, number) in source.iter().enumerate() {
+        let mut bits_of_number = [false; BIT_WIDTH];
+        for bit_index in 0..BIT_WIDTH - 1 {
+            //this is little endian (for big endian shift right and reverse the range 63..0)
+            if (number >> bit_index) & 1 == 1 {
+                bits_of_number[bit_index] = true;
+            }
+        }
+
+        //this would be 0 for index 0,
+        //             64           1,
+        //            128           2,
+        let starting_index = source_index * BIT_WIDTH;
+        //this would be 63 for index 0,
+        //             127           1,
+        //             191           2,
+        let ending_index = ((source_index + 1) * BIT_WIDTH) - 1;
+        for (read_position, write_position) in (starting_index..ending_index).enumerate() {
+            all_bits[write_position] = bits_of_number[read_position];
+        }
+    }
+    all_bits.to_owned()
+}
+
+fn ten_to_two_heap(source: &Vec<u64>) -> Vec<bool> {
+    let mut all_bits = vec![];
+    for number in source {
+        let mut bits_of_number = vec![];
+        for bit_index in 0..BIT_WIDTH {
+            if (number >> bit_index) & 1 == 1 {
+                bits_of_number.push(true);
+            } else {
+                bits_of_number.push(false);
+            }
+        }
+        assert_eq!(bits_of_number.len(), 64);
+        all_bits.append(&mut bits_of_number);
+    }
+    all_bits
+}
+
+const DETECTION_SIZE: usize = NUMBER_OF_ELEMENTS;
+fn detect(bits: &[bool], detection_type: DetectionType) -> [u64; DETECTION_SIZE] {
+    let mut last_bit = None;
+    let mut length = 0;
+    //this one creates an error, A) because there are alot of
+    //leftover zeros even when the addition of detected elements is working
+    let mut runs: [u64; DETECTION_SIZE] = [0; DETECTION_SIZE];
+
+    let mut write_position: usize = 0;
+    for (index, bit) in bits.iter().enumerate() {
+        write_position = index * 64;
+        if last_bit.is_some() {
+            if pattern_detected(&detection_type, *bit, last_bit.unwrap()) {
+                length += 1;
+                last_bit = Some(*bit);
+            } else {
+                if length > 2 {
+                    //but when we append like this to an
+                    //array full to its length, we just
+                    //end up replacing the same last item
+                    runs[write_position] = length;
+                }
+                length = 1;
+                last_bit = Some(*bit);
+            }
+        } else if last_bit.is_none() {
+            length = 1;
+            last_bit = Some(*bit);
+        }
+    }
+    if length > 2 {
+        //so we need an index which keeps track of
+        //which position to insert length
+        //and to cut the output to its runtime size
+        runs[write_position] = length;
+    }
+
+    runs
+}
+
+fn detect_heap(bits: &Vec<bool>, detection_type: DetectionType) -> Vec<u64> {
+    let mut last_bit = None;
+    let mut length = 0;
+    let mut runs = vec![];
+
+    for bit in bits {
+        if last_bit.is_some() {
+            if pattern_detected(&detection_type, *bit, last_bit.unwrap()) {
+                length += 1;
+                last_bit = Some(*bit);
+            } else {
+                if length > 2 {
+                    runs.push(length);
+                }
+                length = 1;
+                last_bit = Some(*bit);
+            }
+        } else if last_bit.is_none() {
+            length = 1;
+            last_bit = Some(*bit);
+        }
+    }
+    if length > 2 {
+        runs.push(length);
+    }
+    runs
+}
+
+fn pattern_detected(detection_type: &DetectionType, bit: bool, last_bit: bool) -> bool {
+    match detection_type {
+        DetectionType::Alternating => bit != last_bit,
+        DetectionType::Ones => bit && last_bit,
+        DetectionType::Zeros => !bit && !last_bit,
+    }
+}
+
+fn tally_lengths(runs: &Vec<u64>) -> HashMap<u64, u64> {
+    let mut run_count = HashMap::new();
+    for length in runs {
+        if *length == 0 {
+            continue;
+        }
+        match run_count.get_mut(length) {
+            Some(count) => *count += 1,
+            None => {
+                run_count.insert(*length, 1);
+            }
+        }
+    }
+    run_count
+}
+
+fn calculate_statistics(
+    total_bits: u64,
+    long_threshold: u64,
+    runs_detected: Detection,
+    timings: &Timings,
+) -> EntropyStatistics {
+    let mut sorted_lengths: Vec<&u64> = runs_detected.run_count.keys().collect();
+    sorted_lengths.sort();
+    let mut total_runs = 0;
+    let mut total_longs = 0;
+    let mut unique_lengths = 0;
+    let mut longest = 0;
+
+    for length in sorted_lengths {
+        let count = *runs_detected.run_count.get(length).unwrap();
+        let run_count = *length * count;
+        total_runs += run_count;
+        unique_lengths += 1;
+
+        if *length > long_threshold {
+            total_longs += *length * count;
+        }
+        if *length > longest {
+            longest = *length;
+        }
+    }
+
+    let long_ratio = total_longs as f64 / total_runs as f64;
+    let avg_map = get_averages(runs_detected.detection_type);
+    let timings = Timings {
+        collection_start: timings.collection_start,
+        collection_end: timings.collection_end,
+        processing_start: timings.processing_start,
+        processing_end: Some(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system time is before 1970??")
+                .as_secs_f64(),
+        ),
+    };
+
+    EntropyStatistics {
+        detection: runs_detected,
+        mode: SourceMode::SystemRandom,
+        total_runs,
+        total_bits,
+        avg_map,
+        long_ratio,
+        longest,
+        unique_lengths,
+        timings,
+    }
+}
+
+fn get_averages(detection_type: DetectionType) -> HashMap<u64, f64> {
+    let mut zeros = HashMap::new();
+    let mut ones = HashMap::new();
+    let mut alternating = HashMap::new();
+
+    if let Some(history) = HISTORY.get() {
+        match detection_type {
+            DetectionType::Zeros => {
+                for length in history.zero_counts.keys() {
+                    let length_count_ratio = *history
+                        .zero_counts
+                        .get(length)
+                        .expect("key is missing a value in HISTORY.counts")
+                        as f64
+                        / history.total as f64;
+                    if zeros.insert(*length, length_count_ratio).is_some() {
+                        panic!("avg_map had duplicate keys")
+                    }
+                }
+                zeros
+            }
+            DetectionType::Ones => {
+                for length in history.one_counts.keys() {
+                    let length_count_ratio = *history
+                        .one_counts
+                        .get(length)
+                        .expect("key is missing a value in HISTORY.counts")
+                        as f64
+                        / history.total as f64;
+                    if ones.insert(*length, length_count_ratio).is_some() {
+                        panic!("avg_map had duplicate keys")
+                    }
+                }
+                ones
+            }
+            DetectionType::Alternating => {
+                for length in history.alternating_counts.keys() {
+                    let length_count_ratio = *history
+                        .alternating_counts
+                        .get(length)
+                        .expect("key is missing a value in HISTORY.counts")
+                        as f64
+                        / history.total as f64;
+                    if alternating.insert(*length, length_count_ratio).is_some() {
+                        panic!("avg_map had duplicate keys")
+                    }
+                }
+                alternating
+            }
+        }
+    } else {
+        panic!("must call detector::get_history() on app start");
+    }
+}
+
+fn save_timestep(statistics: &EntropyStatistics) {
+    let mut file = File::options()
+        .append(true)
+        .create(true)
+        .open("sequence_history.json")
+        .expect("failed to open sequence_history file");
+
+    writeln!(
+        &mut file,
+        "{}",
+        serde_json::to_string(&statistics).expect("failed to serialize statistics"),
+    )
+    .expect("failed to write new timestep to sequence file");
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub enum SourceMode {
+    GrayCompressedVideo,
+    RGBCompressedVideo,
+    GrayRawVideo,
+    RGBRawVideo,
+    Audio,
+    SystemRandom,
+    PseudoRandom,
+    CPURandom,
+    PeripheralRandom,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct EntropyStatistics {
+    pub detection: Detection,
+    pub mode: SourceMode,
+    pub total_runs: u64,
+    pub total_bits: u64,
+    pub avg_map: HashMap<u64, f64>,
+    pub long_ratio: f64,
+    pub longest: u64,
+    pub unique_lengths: u64,
+    pub timings: Timings,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct Detection {
+    pub run_count: HashMap<u64, u64>,
+    pub detection_type: DetectionType,
+}
+
+#[derive(Serialize, Deserialize, Debug, Copy, Clone)]
+pub enum DetectionType {
+    Zeros,
+    Ones,
+    Alternating,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy)]
+pub struct Timings {
+    pub collection_start: f64,
+    pub collection_end: f64,
+    pub processing_start: f64,
+    pub processing_end: Option<f64>,
+}
+
+const ITERATIONS: usize = 1_000_000;
+///entrypoint
+pub fn source_and_calculate(long_threshold: u64) -> Vec<EntropyStatistics> {
+    let total_bits = (ITERATIONS * 64) as u64;
+    //let mut input_data: [u64; ITERATIONS] = [0; ITERATIONS];
+    let mut input_data = vec![];
+
+    let collection_start = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time is before 1970??")
+        .as_secs_f64();
+
+    for _write_position in 0..ITERATIONS {
+        //input_data[write_position] =
+        input_data.push(
+            OsRng
+                // my version of mac os uses the Yarrow CSPRNG
+                // two entropy pools are seeded from hardware
+                // sensors and user input.
+                .try_next_u64()
+                .expect("failed to get random number from OS"),
+        );
+    }
+    // collection requires between 0.8 and 1.5 seconds
+    let collection_end = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time is before 1970??")
+        .as_secs_f64();
+
+    let processing_start = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time is before 1970??")
+        .as_secs_f64();
+
+    // we can start out measurement thread before this vv
+    let bits = Arc::new(ten_to_two_heap(&input_data));
+
+    let timings = Timings {
+        collection_start,
+        collection_end,
+        processing_start,
+        processing_end: None,
+    };
+
+    let statistics = start_detection_threads(&bits, long_threshold, total_bits, timings);
+    for statistic in &statistics {
+        // the persistence requires 1.5Kb per sample
+        save_timestep(statistic);
+    }
+    statistics
+}
+
+fn start_detection_threads(
+    bits: &Arc<Vec<bool>>,
+    long_threshold: u64,
+    total_bits: u64,
+    timings: Timings,
+) -> Vec<EntropyStatistics> {
+    let mut threads = vec![];
+    const THREAD_STACK_SIZE: usize = 2000 * 1024;
+
+    let detection_variants = vec![
+        DetectionType::Alternating,
+        DetectionType::Ones,
+        DetectionType::Zeros,
+    ];
+    for detection_type in detection_variants {
+        let thread_bits = bits.clone();
+        let detection_thread = thread::Builder::new()
+            //.stack_size(THREAD_STACK_SIZE)
+            .name(format!("{:?}", detection_type))
+            .spawn(move || {
+                let mut runs_detected = Detection {
+                    run_count: HashMap::new(),
+                    detection_type,
+                };
+
+                let runs = detect_heap(&thread_bits, runs_detected.detection_type);
+                runs_detected.run_count = tally_lengths(&runs.to_vec());
+                // processing takes between 1 and 3 seconds?
+                calculate_statistics(total_bits, long_threshold, runs_detected, &timings)
+            })
+            .unwrap_or_else(|_| {
+                panic!(
+                    "failed to spawn the alternating thread with stack size: {}",
+                    THREAD_STACK_SIZE
+                )
+            });
+        threads.push(detection_thread);
+    }
+    let mut all_statistics = vec![];
+    for thread in threads {
+        let statistics = thread.join().expect("a thread panicked!");
+        all_statistics.push(statistics);
+    }
+    all_statistics
+}
+
+//after we get the basic version done, we will sample the camera and mic instead
+//then we will add parallelization by keeping counts of alternating and non alternating
+//sequences in structs, and filling an input array with a one frame or one second of audio
+//breaking that array into equal chunks and iterating over each one, keeping track of
+//whether a sequence of alternating bits completes, meaning that it is followed by a
+//non alternating bit or sequence before the end of the array chunk, and what bit starts
+//the sequence, so that sequences across array boundaries can be patched together in the
+//count.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn forty_two_to_two_static() {
+        let mut number: [u64; ITERATIONS] = [0; ITERATIONS];
+        number[0] = 42;
+        let number = Arc::new(number);
+        let bits = ten_to_two(&number);
+        let mut expected_output = [false; NUMBER_OF_ELEMENTS];
+        expected_output[1] = true;
+        expected_output[3] = true;
+        expected_output[5] = true;
+        assert_eq!(bits, expected_output);
+    }
+
+    #[test]
+    fn forty_two_to_two_dynamic() {
+        let mut number = vec![0];
+        number[0] = 42;
+        let number = Arc::new(number);
+        let bits = ten_to_two_heap(&number);
+        let mut expected_output = vec![false; NUMBER_OF_ELEMENTS];
+        expected_output[1] = true;
+        expected_output[3] = true;
+        expected_output[5] = true;
+        assert_eq!(bits, expected_output);
+    }
+
+    #[test]
+    fn detect_alternating_runs_static() {
+        let mut input_data_1 = [false; NUMBER_OF_ELEMENTS];
+        input_data_1[0] = true;
+        input_data_1[2] = true;
+        input_data_1[4] = true;
+        input_data_1[5] = true;
+        input_data_1[6] = true;
+        input_data_1[7] = true;
+        input_data_1[8] = true;
+        let result = detect(&input_data_1, DetectionType::Alternating);
+        let mut expected: [u64; DETECTION_SIZE] = [0; DETECTION_SIZE];
+        expected[0] = 5;
+        assert_eq!(result, expected);
+
+        let mut input_data_2 = [false; NUMBER_OF_ELEMENTS];
+        input_data_2[0] = true;
+        input_data_2[1] = true;
+        input_data_2[2] = true;
+        input_data_2[5] = true;
+        input_data_2[7] = true;
+        input_data_2[10] = true;
+        let result = detect(&input_data_2, DetectionType::Alternating);
+        let mut expected: [u64; DETECTION_SIZE] = [0; DETECTION_SIZE];
+        expected[0] = 5;
+        assert_eq!(result, expected);
+
+        let mut input_data_3 = [false; NUMBER_OF_ELEMENTS];
+        input_data_3[1] = true;
+        input_data_3[6] = true;
+        input_data_3[7] = true;
+        input_data_3[9] = true;
+        let result = detect(&input_data_3, DetectionType::Alternating);
+        let mut expected: [u64; DETECTION_SIZE] = [0; DETECTION_SIZE];
+        expected[0] = 3;
+        expected[1] = 4;
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn detect_alternating_runs_heap() {
+        let mut input_data_1 = vec![false; 20];
+        input_data_1[0] = true;
+        input_data_1[2] = true;
+        input_data_1[4] = true;
+        input_data_1[5] = true;
+        input_data_1[6] = true;
+        input_data_1[7] = true;
+        input_data_1[8] = true;
+        let result = detect_heap(&input_data_1, DetectionType::Alternating);
+        let mut expected: [u64; DETECTION_SIZE] = [0; DETECTION_SIZE];
+        expected[0] = 5;
+        assert_eq!(result, expected);
+
+        let mut input_data_2 = vec![false; 20];
+        input_data_2[0] = true;
+        input_data_2[1] = true;
+        input_data_2[2] = true;
+        input_data_2[5] = true;
+        input_data_2[7] = true;
+        input_data_2[10] = true;
+        let result = detect_heap(&input_data_2, DetectionType::Alternating);
+        let mut expected: [u64; DETECTION_SIZE] = [0; DETECTION_SIZE];
+        expected[0] = 5;
+
+        assert_eq!(result, expected);
+
+        let mut input_data_3 = vec![false; 20];
+        input_data_3[1] = true;
+        input_data_3[6] = true;
+        input_data_3[7] = true;
+        input_data_3[9] = true;
+        let result = detect_heap(&input_data_3, DetectionType::Alternating);
+        let mut expected: [u64; DETECTION_SIZE] = [0; DETECTION_SIZE];
+        expected[0] = 3;
+        expected[1] = 4;
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn detect_no_alternating_runs_static() {
+        let input_data = vec![false, false, false, false, false, false];
+        let result = detect(&input_data, DetectionType::Alternating);
+        let empty_vec: [u64; DETECTION_SIZE] = [0; DETECTION_SIZE];
+        assert_eq!(result, empty_vec);
+    }
+
+    #[test]
+    fn detect_runs_of_ones_stack() {
+        let mut input_data_1 = [false; NUMBER_OF_ELEMENTS];
+        input_data_1[0] = true;
+        input_data_1[2] = true;
+        input_data_1[4] = true;
+        input_data_1[5] = true;
+        input_data_1[6] = true;
+        input_data_1[7] = true;
+        input_data_1[8] = true;
+
+        let result = detect(&input_data_1, DetectionType::Ones);
+        let mut expected: [u64; DETECTION_SIZE] = [0; DETECTION_SIZE];
+        expected[0] = 5;
+        assert_eq!(result, expected);
+
+        let input_data_2 = vec![
+            true, true, true, false, false, true, false, true, false, false, true,
+        ];
+        let result = detect(&input_data_2, DetectionType::Ones);
+        let mut expected: [u64; DETECTION_SIZE] = [0; DETECTION_SIZE];
+        expected[0] = 3;
+        assert_eq!(result, expected);
+
+        let input_data_3 = vec![
+            false, true, false, false, false, false, true, true, true, true, false,
+        ];
+        let result = detect(&input_data_3, DetectionType::Ones);
+        let mut expected: [u64; DETECTION_SIZE] = [0; DETECTION_SIZE];
+        expected[0] = 4;
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn detect_runs_of_zeros_stack() {
+        let input_data_1 = vec![
+            true, false, false, false, true, true, true, true, true, false,
+        ];
+        let result = detect(&input_data_1, DetectionType::Zeros);
+        let mut expected: [u64; DETECTION_SIZE] = [0; DETECTION_SIZE];
+        expected[0] = 3;
+        assert_eq!(result, expected);
+
+        let input_data_2 = vec![
+            true, true, true, false, false, true, false, false, false, false, false,
+        ];
+        let result = detect(&input_data_2, DetectionType::Zeros);
+        let mut expected: [u64; DETECTION_SIZE] = [0; DETECTION_SIZE];
+        expected[0] = 5;
+        assert_eq!(result, expected);
+
+        let input_data_3 = vec![
+            false, true, false, false, false, false, true, true, true, true, false,
+        ];
+        let result = detect(&input_data_3, DetectionType::Zeros);
+        let mut expected: [u64; DETECTION_SIZE] = [0; DETECTION_SIZE];
+        expected[0] = 4;
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn tally_short_runs() {
+        let detection_result = vec![5, 2, 6, 5, 8, 8, 10];
+        let run_count = tally_lengths(&detection_result);
+        let mut tally_keys = run_count.keys().map(|key| *key).collect::<Vec<u64>>();
+        tally_keys.sort();
+        assert_eq!(tally_keys, vec![2, 5, 6, 8, 10]);
+        assert_eq!(run_count.get(&2), Some(&1));
+        assert_eq!(run_count.get(&5), Some(&2));
+        assert_eq!(run_count.get(&6), Some(&1));
+        assert_eq!(run_count.get(&8), Some(&2));
+        assert_eq!(run_count.get(&10), Some(&1));
+        assert_eq!(run_count.get(&42), None);
+    }
+
+    #[test]
+    fn tally_no_runs() {
+        let detection_result = vec![];
+        let run_count = tally_lengths(&detection_result);
+        let empty_vec: Vec<&u64> = vec![];
+        assert_eq!(run_count.keys().collect::<Vec<&u64>>(), empty_vec);
+    }
+    /*
+    #[test]
+    fn calculate_statistics_with_runs() {
+
+    }
+
+    #[test]
+    fn calculate_statistics_with_no_runs() {
+
+    }
+    */
+}

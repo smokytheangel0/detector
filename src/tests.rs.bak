@@ -1,0 +1,247 @@
+///
+/// TDD Test Suite for `detector` Crate
+///
+/// To use this, add the following line to the top of your `detector/src/lib.rs`:
+///
+/// ```rust
+/// #[cfg(test)]
+/// mod tests;
+/// ```
+///
+/// These tests will fail (RED) when you delete your function bodies.
+/// Your goal is to make them pass (GREEN) one by one.
+///
+#[cfg(test)]
+mod tests {
+    // Import all public items from the parent library
+    use super::*;
+    use proptest::prelude::*;
+    use proptest::collection::vec as prop_vec;
+
+    // --- Test Helpers ---
+
+    /// Helper to create a simple test event.
+    fn ev(id: u64, name: &str) -> Event {
+        Event {
+            id,
+            name: name.to_string(),
+            data: "test_data".to_string(),
+        }
+    }
+
+    /// Helper to create a test sequence.
+    fn seq(name: &str, event_names: &[&str]) -> Sequence {
+        Sequence {
+            name: name.to_string(),
+            events: event_names.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    /// Helper to create a `VecDeque` from event names.
+    fn history_from_names(names: &[&str]) -> VecDeque<Event> {
+        names.iter().enumerate().map(|(i, name)| ev(i as u64, name)).collect()
+    }
+
+    // --- SequenceDetector Unit Tests ---
+
+    #[test]
+    fn test_detect_empty_history() {
+        let detector = SequenceDetector::new(vec![seq("A", &["E1", "E2"])]);
+        let history = history_from_names(&[]);
+        assert_eq!(detector.detect(&history), None);
+    }
+
+    #[test]
+    fn test_detect_no_sequences_to_match() {
+        let detector = SequenceDetector::new(vec![]);
+        let history = history_from_names(&["E1", "E2"]);
+        assert_eq!(detector.detect(&history), None);
+    }
+
+    #[test]
+    fn test_detect_no_match() {
+        let detector = SequenceDetector::new(vec![seq("A", &["E1", "E2"])]);
+        let history = history_from_names(&["E3", "E4"]);
+        assert_eq!(detector.detect(&history), None);
+    }
+
+    #[test]
+    fn test_detect_partial_match() {
+        let detector = SequenceDetector::new(vec![seq("A", &["E1", "E2", "E3"])]);
+        let history = history_from_names(&["E1", "E2"]);
+        assert_eq!(detector.detect(&history), None);
+    }
+
+    #[test]
+    fn test_detect_exact_match() {
+        let detector = SequenceDetector::new(vec![seq("A", &["E1", "E2"])]);
+        let history = history_from_names(&["E1", "E2"]);
+        assert_eq!(detector.detect(&history), Some("A".to_string()));
+    }
+
+    #[test]
+    fn test_detect_match_at_end_of_history() {
+        let detector = SequenceDetector::new(vec![seq("A", &["E1", "E2"])]);
+        let history = history_from_names(&["X", "Y", "Z", "E1", "E2"]);
+        assert_eq!(detector.detect(&history), Some("A".to_string()));
+    }
+
+    #[test]
+    fn test_detect_match_not_at_end_fails() {
+        // This test assumes `detect` only matches at the *end* of history.
+        let detector = SequenceDetector::new(vec![seq("A", &["E1", "E2"])]);
+        let history = history_from_names(&["E1", "E2", "X", "Y"]);
+        assert_eq!(detector.detect(&history), None);
+    }
+
+    #[test]
+    fn test_detect_first_of_multiple_sequences() {
+        let detector = SequenceDetector::new(vec![
+            seq("A", &["E1", "E2"]),
+            seq("B", &["E3", "E4"]),
+        ]);
+        let history = history_from_names(&["E3", "E4"]);
+        // Assumes it returns the first one that matches
+        assert_eq!(detector.detect(&history), Some("B".to_string()));
+    }
+
+    // --- SequenceMonitor Unit Tests ---
+
+    #[test]
+    fn test_monitor_process_event_no_detection() {
+        let detector = SequenceDetector::new(vec![seq("A", &["E1", "E2"])]);
+        let mut monitor = SequenceMonitor::new(detector, 10);
+        assert_eq!(monitor.process_event(ev(1, "E1")), None);
+    }
+
+    #[test]
+    fn test_monitor_process_event_triggers_detection() {
+        let detector = SequenceDetector::new(vec![seq("A", &["E1", "E2"])]);
+        let mut monitor = SequenceMonitor::new(detector, 10);
+        
+        let res1 = monitor.process_event(ev(1, "E1"));
+        assert_eq!(res1, None, "Should not detect on partial sequence");
+        
+        let res2 = monitor.process_event(ev(2, "E2"));
+        assert_eq!(res2, Some("A".to_string()), "Should detect on full sequence");
+    }
+
+    #[test]
+    fn test_monitor_respects_max_history_bound() {
+        // Sequence is "B", "C"
+        let detector = SequenceDetector::new(vec![seq("A", &["B", "C"])]);
+        let mut monitor = SequenceMonitor::new(detector, 2); // max_history = 2
+
+        // Event "A" (History: ["A"])
+        let res1 = monitor.process_event(ev(1, "A"));
+        assert_eq!(res1, None);
+
+        // Event "B" (History: ["A", "B"])
+        let res2 = monitor.process_event(ev(2, "B"));
+        assert_eq!(res2, None); // "A", "B" != "B", "C"
+
+        // Event "C" (History: ["B", "C"] because "A" was popped)
+        let res3 = monitor.process_event(ev(3, "C"));
+        assert_eq!(res3, Some("A".to_string()), "Should detect 'B', 'C'");
+    }
+
+    // --- Property-Based Tests ---
+
+    // Define strategies for generating test data
+    // We generate tuples and map them to Events/Sequences
+    
+    /// Strategy to generate a single event's data: (id, name, data)
+    /// We use a regex for name to avoid empty strings, which can be tricky.
+    fn event_data_strategy() -> impl Strategy<Value = (u64, String, String)> {
+        (
+            any::<u64>(),
+            "[a-zA-Z]{1,10}".prop_map(|s| s.to_string()),
+            ".{0,50}".prop_map(|s| s.to_string()),
+        )
+    }
+
+    /// Strategy to generate a list of event data
+    fn event_data_list_strategy() -> impl Strategy<Value = Vec<(u64, String, String)>> {
+        prop_vec(event_data_strategy(), 0..100)
+    }
+
+    /// Strategy to generate a Sequence: (name, event_names)
+    /// `event_names` list will have 1 to 10 events.
+    fn sequence_data_strategy() -> impl Strategy<Value = (String, Vec<String>)> {
+        (
+            "[a-zA-Z]{1,10}".prop_map(|s| s.to_string()),
+            prop_vec("[a-zA-Z]{1,10}".prop_map(|s| s.to_string()), 1..10),
+        )
+    }
+
+    proptest! {
+        /// Test that the detector never panics, no matter the history
+        #[test]
+        fn proptest_detect_never_panics(
+            history_data in event_data_list_strategy(),
+            seq_data in sequence_data_strategy()
+        ) {
+            let history: VecDeque<Event> = history_data.into_iter()
+                .map(|(id, name, data)| Event { id, name, data })
+                .collect();
+            
+            let sequence = Sequence {
+                name: seq_data.0,
+                events: seq_data.1,
+            };
+
+            let detector = SequenceDetector::new(vec![sequence]);
+            
+            // This call should just... not panic.
+            let _ = detector.detect(&history);
+        }
+
+        /// Test that the monitor never panics when processing events
+        #[test]
+        fn proptest_monitor_never_panics(
+            events_data in event_data_list_strategy(),
+            seq_data in sequence_data_strategy(),
+            max_history in 1..100usize // Use a realistic non-zero history
+        ) {
+            let sequence = Sequence {
+                name: seq_data.0,
+                events: seq_data.1,
+            };
+            let detector = SequenceDetector::new(vec![sequence]);
+            let mut monitor = SequenceMonitor::new(detector, max_history);
+
+            for (id, name, data) in events_data {
+                let event = Event { id, name, data };
+                // This call should just... not panic.
+                let _ = monitor.process_event(event);
+            }
+        }
+
+        /// If a sequence is the *only* thing in history, it MUST be detected.
+        #[test]
+        fn proptest_detect_finds_exact_sequence(
+            seq_data in sequence_data_strategy()
+        ) {
+            let seq_name = seq_data.0;
+            let event_names = seq_data.1;
+
+            let sequence = Sequence {
+                name: seq_name.clone(),
+                events: event_names.clone(),
+            };
+            
+            let detector = SequenceDetector::new(vec![sequence]);
+
+            // Create a history that is *exactly* the sequence
+            let history: VecDeque<Event> = event_names.into_iter().enumerate()
+                .map(|(i, name)| Event { id: i as u64, name, data: "".to_string() })
+                .collect();
+
+            // Proptest requires the test *not* to panic.
+            // We use `prop_assume` to skip empty/invalid cases.
+            prop_assume!(!history.is_empty());
+
+            assert_eq!(detector.detect(&history), Some(seq_name));
+        }
+    }
+}

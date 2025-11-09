@@ -1,0 +1,23 @@
+[package]
+name = "detector"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# no_std by default
+serde = { version = "1.0", default-features = false, features = ["derive"], optional = true }
+serde_json = { version = "1.0", default-features = false, optional = true }
+rand_core = { version = "0.6", default-features = false, optional = true }
+proptest = "1.9.0"
+
+[features]
+# This "std" feature flag enables all the std-dependent crates and features
+default = []
+std = [
+    "serde/std",
+    "serde_json/std",
+    "rand_core/std",
+    "dep:serde",
+    "dep:serde_json",
+    "dep:rand_core",
+]
