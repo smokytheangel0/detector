@@ -139,16 +139,17 @@ pub fn ten_to_two_static(source: &[u64], all_bits: &mut [bool]) -> (result: Resu
         // --- FIX: Removed redundant/incorrect `by` block ---
         // The loop condition `i < source.len()` already proves this.
         assert(i < source.len());
+        assert(0 <= i * BIT_WIDTH < usize::MAX);
 
         let starting_index = i * BIT_WIDTH;
 
         let mut bit_index = 0;
         while bit_index < BIT_WIDTH
             invariant ({
-                let i_int = i as int; // Use `i_int` to avoid shadowing `i: usize`
-                let bit_index_int = bit_index as int;
-                let source_length_int = source.len() as int;
-                let bit_width_int = BIT_WIDTH as int;
+                let i = i as int; // Use `i_int` to avoid shadowing `i: usize`
+                let bit_index = bit_index as int;
+                let source_length = source.len() as int;
+                let bit_width = BIT_WIDTH as int;
 
                 i < source.len(); // Use `i: usize`
                 0 <= bit_index <= BIT_WIDTH; // Use `bit_index: usize`
@@ -159,38 +160,41 @@ pub fn ten_to_two_static(source: &[u64], all_bits: &mut [bool]) -> (result: Resu
                 // ------------------------------------------
 
                 forall|i_prev: int, j: int|
-                    0 <= i_prev < i_int && 0 <= j < bit_width_int ==>
-                        all_bits[i_prev * bit_width_int + j] === ((source[i_prev] >> j) & 1 == 1) &&
+                    0 <= i_prev < i && 0 <= j < bit_width ==>
+                        all_bits[i_prev * bit_width + j] === ((source[i_prev] >> j) & 1 == 1) &&
                 forall|j_prev: int|
-                    0 <= j_prev < bit_index_int ==>
-                        all_bits[i_int * bit_width_int + j_prev] === ((source[i_int] >> j_prev) & 1 == 1)
+                    0 <= j_prev < bit_index ==>
+                        all_bits[i * bit_width + j_prev] === ((source[i] >> j_prev) & 1 == 1)
             })
             decreases (BIT_WIDTH as int) - (bit_index as int)
         {
+            assert(0 <= starting_index + bit_index < all_bits.len());
             let write_index = starting_index + bit_index;
 
             // --- FIX: Corrected the assertions in the `by` block ---
             assert(write_index < all_bits.len()) by {
-                let i_int = i as int;
-                let bit_index_int = bit_index as int;
-                let source_length_int = source.len() as int;
-                let bit_width_int = BIT_WIDTH as int;
+                let i = i as int;
+                let bit_index = bit_index as int;
+                let source_length = source.len() as int;
+                let bit_width = BIT_WIDTH as int;
+                let write_index = write_index as int;
+                let bits_length = all_bits.len() as int;
 
                 // Assert facts from invariants (using usize)
                 assert(i < source.len());
                 assert(bit_index < BIT_WIDTH);
 
                 // Assert arithmetic (using int)
-                assert(write_index as int == i_int * bit_width_int + bit_index_int);
-                assert((write_index as int) < (i_int + 1) * bit_width_int); // <-- THIS IS LINE 185
-                assert(i_int + 1 <= source_length_int);
-                assert((i_int + 1) * bit_width_int <= source_length_int * bit_width_int);
-                assert((write_index as int) < source_length_int * bit_width_int);
+                assert(write_index == i * bit_width + bit_index);
+                assert(write_index < (i + 1) * bit_width); // <-- THIS IS LINE 185
+                assert(i + 1 <= source_length);
+                assert((i + 1) * bit_width <= source_length * bit_width);
+                assert(write_index < source_length * bit_width);
 
                 // Assert connection to all_bits.len()
-                assert(all_bits.len() as int == source_length_int * bit_width_int);
-                assert((write_index as int) < (all_bits.len() as int));
-                assert(write_index < all_bits.len()); //□
+                assert(bits_length == source_length * bit_width);
+                assert(write_index < bits_length);
+                assert(write_index < bits_length); //□
             };
             all_bits[starting_index + bit_index] = (number >> bit_index) & 1 == 1;
             bit_index += 1;
