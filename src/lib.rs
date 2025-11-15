@@ -1,218 +1,257 @@
-#![cfg_attr(not(feature = "std"), no_std)]
-#![doc = "A no_std, allocation-free library for detecting bit-run entropy."]
-use vstd::prelude::*;
-verus! {
-// --- Add this line ---
-// This conditionally includes the std_impl.rs file ONLY
-// when the "std" feature is enabled in Cargo.toml.
-#[cfg(feature = "std")]
-pub mod std_impl;
-// -------------------
+use std::collections::HashMap;
+use std::fs::File;
+use std::io::{Read, Write};
+use std::sync::{Arc, OnceLock};
+use std::thread;
+use std::time::{SystemTime, UNIX_EPOCH};
+extern crate serde;
+extern crate serde_json;
+use rand_core::{OsRng, RngCore};
+use serde::{Deserialize, Serialize};
 
-// --- Constants ---
+//70 expect!, 4 unwrap!, 22 vec!
+static HISTORY: OnceLock<History> = OnceLock::new();
 
-/// The bit-width of the source integers.
-pub const BIT_WIDTH: usize = 64;
-
-// --- Public Structs & Enums (no_std) ---
-
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
-pub enum DetectionType {
-    Zeros,
-    Ones,
-    Alternating,
+#[derive(Debug)]
+struct History {
+    zero_counts: HashMap<u64, u64>,
+    one_counts: HashMap<u64, u64>,
+    alternating_counts: HashMap<u64, u64>,
+    total: u64,
 }
 
-// NOTE: This struct is now hidden from Verus using #[cfg(not(verus))]
-// because Verus cannot parse f64. This struct is only used by
-// std_impl.rs and the tests.
-#[cfg(not(verus))]
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct Timings {
-    pub collection_start: f64,
-    pub collection_end: f64,
-    pub processing_start: f64,
-    pub processing_end: Option<f64>,
-}
-
-// NOTE: This is a Verus-visible dummy struct.
-// The real logic in calculate_statistics_static will be marked trusted,
-// so Verus will accept this type mismatch.
-#[cfg(verus)]
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct Timings {}
-
-/// A no_std, static-array-based struct to hold detection results.
-/// `run_counts[i]` stores the count of runs of
-#[derive(Debug, PartialEq, Eq)]
-pub struct DetectionStatic<const MAX_LEN: usize> {
-    /// `run_counts[i]` holds the count of runs of length `i`.
-    /// `run_counts[0]` is unused.
-    pub run_counts: [u64; MAX_LEN],
-    pub detection_type: DetectionType,
-}
-
-impl<const MAX_LEN: usize> DetectionStatic<MAX_LEN> {
-    /// Creates a new, zeroed DetectionStatic store.
-    pub fn new(detection_type: DetectionType) -> Self {
-        Self {
-            run_counts: [0; MAX_LEN],
-            detection_type,
-        }
-    }
-}
-
-/// A no_std, static-array-based struct for the final statistics.
-// NOTE: This struct is now Verus-visible as f64 has been removed.
-#[derive(Debug, PartialEq)]
-pub struct EntropyStatisticsStatic<const MAX_LEN: usize> {
-    pub detection: DetectionStatic<MAX_LEN>,
-    /// Total number of bits that are part of a detected run.
-    /// e.g., 3 runs of length 5 = 15.
-    pub total_runs: u64,
-    /// Total number of bits that were part of a "long" run.
-    pub total_longs_in_runs: u64, // <-- CHANGED FROM long_ratio: f64
-    pub total_bits: u64,
-    pub longest: u64,
-    pub unique_lengths: u64,
-    // NOTE: This field is #[cfg]d. Verus sees the dummy Timings type.
-    // cargo test/build sees the real Timings type.
-    pub timings: Timings,
-}
-
-/// Errors that can occur during static analysis.
-#[derive(Debug, PartialEq, Eq)]
-pub enum AnalysisError {
-    /// The provided output buffer is too small for the result.
-    OutputBufferTooSmall,
-    /// A detected run length exceeds the size of the tallying array.
-    RunLengthTooLong,
-}
-
-// --- Pure, no_std Analysis Functions ---
-// These are the functions you will implement for the kata.
-
-/// Converts a slice of `u64` into a slice of `bool` (little-endian).
-///
-/// The caller MUST ensure `all_bits.len() == source.len() * BIT_WIDTH`.
-pub fn ten_to_two_static(source: &[u64], all_bits: &mut [bool]) -> (result: Result<(), AnalysisError>)
-    requires
-        old(all_bits).len() == source.len() * BIT_WIDTH,
-        source.len() < usize::MAX / BIT_WIDTH,
-    ensures
-        // We can't easily express the full functional correctness here without
-        // complex bitvector specs, so we'll leave it simple.
-        // A more complex spec would look like:
-        forall|i: int, j: int| 0 <= i < (source.len() as int) && 0 <= j < (BIT_WIDTH as int) ==>
-             all_bits[i * (BIT_WIDTH as int) + j] === ((source[i] >> j) & 1 == 1)
-{
-    if all_bits.len() != source.len() * BIT_WIDTH {
-        return Err(AnalysisError::OutputBufferTooSmall);
-    }
-
-    let mut i = 0;
-    while i < source.len()
-        invariant ({
-            // Hoisted casts
-            let i = i as int;
-            let source_length = source.len() as int;
-            let bit_width = BIT_WIDTH as int;
-
-            // Simple invariants become statements with semicolons
-            0 <= i;
-            i <= source_length;
-
-            // --- FIX: Add preconditions to invariant ---
-            all_bits.len() == source.len() * BIT_WIDTH;
-            source.len() < usize::MAX / BIT_WIDTH;
-            // ------------------------------------------
-
-            // The forall is the final expression (no semicolon)
-            forall|i_prev: int, j: int|
-                0 <= i_prev < i && 0 <= j < bit_width ==>
-                    all_bits[i_prev * bit_width + j] === ((source[i_prev] >> j) & 1 == 1)
-        })
-        decreases source.len() - i
-    {
-        let number = source[i];
-
-        // --- FIX: Removed redundant/incorrect `by` block ---
-        // The loop condition `i < source.len()` already proves this.
-        assert(i < source.len());
-        assert(0 <= i * BIT_WIDTH < usize::MAX);
-
-        let starting_index = i * BIT_WIDTH;
-
-        let mut bit_index = 0;
-        while bit_index < BIT_WIDTH
-            invariant ({
-                let i = i as int; // Use `i_int` to avoid shadowing `i: usize`
-                let bit_index = bit_index as int;
-                let source_length = source.len() as int;
-                let bit_width = BIT_WIDTH as int;
-
-                i < source.len(); // Use `i: usize`
-                0 <= bit_index <= BIT_WIDTH; // Use `bit_index: usize`
-
-                // --- FIX: Add preconditions to invariant ---
-                all_bits.len() == source.len() * BIT_WIDTH;
-                source.len() < usize::MAX / BIT_WIDTH;
-                // ------------------------------------------
-
-                forall|i_prev: int, j: int|
-                    0 <= i_prev < i && 0 <= j < bit_width ==>
-                        all_bits[i_prev * bit_width + j] === ((source[i_prev] >> j) & 1 == 1) &&
-                forall|j_prev: int|
-                    0 <= j_prev < bit_index ==>
-                        all_bits[i * bit_width + j_prev] === ((source[i] >> j_prev) & 1 == 1)
-            })
-            decreases (BIT_WIDTH as int) - (bit_index as int)
-        {
-            assert(0 <= starting_index + bit_index < all_bits.len());
-            let write_index = starting_index + bit_index;
-
-            // --- FIX: Corrected the assertions in the `by` block ---
-            assert(write_index < all_bits.len()) by {
-                let i = i as int;
-                let bit_index = bit_index as int;
-                let source_length = source.len() as int;
-                let bit_width = BIT_WIDTH as int;
-                let write_index = write_index as int;
-                let bits_length = all_bits.len() as int;
-
-                // Assert facts from invariants (using usize)
-                assert(i < source.len());
-                assert(bit_index < BIT_WIDTH);
-
-                // Assert arithmetic (using int)
-                assert(write_index == i * bit_width + bit_index);
-                assert(write_index < (i + 1) * bit_width); // <-- THIS IS LINE 185
-                assert(i + 1 <= source_length);
-                assert((i + 1) * bit_width <= source_length * bit_width);
-                assert(write_index < source_length * bit_width);
-
-                // Assert connection to all_bits.len()
-                assert(bits_length == source_length * bit_width);
-                assert(write_index < bits_length);
-                assert(write_index < bits_length); //□
-            };
-            all_bits[starting_index + bit_index] = (number >> bit_index) & 1 == 1;
-            bit_index += 1;
-
-            assert({
-                let i = i as int;
-                let bit_width = BIT_WIDTH as int;
-                forall|j: int| 0 <= j < bit_width ==>
-                    all_bits[i * bit_width + j] === ((source[i] >> j) & 1 ==1)
+/// This should be called on app start
+pub fn get_history() {
+    let file = match File::options().read(true).open("sequence_history.json") {
+        Ok(file) => Some(file),
+        Err(_) => {
+            HISTORY.get_or_init(|| History {
+                zero_counts: HashMap::new(),
+                one_counts: HashMap::new(),
+                alternating_counts: HashMap::new(),
+                total: 0,
             });
+            None
         }
-        i += 1;
+    };
+
+    if let Some(mut file) = file {
+        let mut file_contents = String::new();
+        file.read_to_string(&mut file_contents)
+            .expect("failed to read from sequence_history.csv");
+
+        let mut total = 0;
+        let mut zero_counts: HashMap<u64, u64> = HashMap::new();
+        let mut one_counts: HashMap<u64, u64> = HashMap::new();
+        let mut alternating_counts: HashMap<u64, u64> = HashMap::new();
+
+        for (line_number, line) in file_contents.split("\n").enumerate() {
+            if line.is_empty() {
+                continue;
+            }
+            let statistics: EntropyStatistics = serde_json::from_str(line).unwrap_or_else(|_| {
+                panic!(
+                    "failed to read line {} from sequence_history.csv",
+                    line_number
+                )
+            });
+
+            total += statistics.total_bits;
+            for length in statistics.detection.run_count.keys() {
+                match statistics.detection.detection_type {
+                    DetectionType::Zeros => {
+                        if let Some(old_count) =
+                            zero_counts.insert(
+                                *length,
+                                *statistics.detection.run_count.get(length).expect(
+                                    "run_count from sequence_history had a key with no value",
+                                ),
+                            )
+                        {
+                            zero_counts.insert(
+                                *length,
+                                *statistics.detection.run_count.get(length).expect(
+                                    "run_count from sequence_history had a key with no value",
+                                ) + old_count,
+                            );
+                        };
+                    }
+                    DetectionType::Ones => {
+                        if let Some(old_count) =
+                            one_counts.insert(
+                                *length,
+                                *statistics.detection.run_count.get(length).expect(
+                                    "run_count from sequence_history had a key with no value",
+                                ),
+                            )
+                        {
+                            one_counts.insert(
+                                *length,
+                                *statistics.detection.run_count.get(length).expect(
+                                    "run_count from sequence_history had a key with no value",
+                                ) + old_count,
+                            );
+                        };
+                    }
+                    DetectionType::Alternating => {
+                        if let Some(old_count) =
+                            alternating_counts.insert(
+                                *length,
+                                *statistics.detection.run_count.get(length).expect(
+                                    "run_count from sequence_history had a key with no value",
+                                ),
+                            )
+                        {
+                            alternating_counts.insert(
+                                *length,
+                                *statistics.detection.run_count.get(length).expect(
+                                    "run_count from sequence_history had a key with no value",
+                                ) + old_count,
+                            );
+                        };
+                    }
+                }
+            }
+        }
+        HISTORY.get_or_init(|| History {
+            zero_counts,
+            one_counts,
+            alternating_counts,
+            total,
+        });
     }
-    Ok(())
 }
 
-/// Helper function to check for the run pattern.
-fn pattern_detected(detection_type: DetectionType, bit: bool, last_bit: bool) -> bool {
+//we get a stack overflow from cargo test, so our math must be off
+//once we get that right, this seems to be a good demo for arrays
+const BIT_WIDTH: usize = 64; //could also use usize::BITS, but everything else is hardwired 64bit
+//the output array must be the size of the source * 64
+//in the source the bits are arranged as 64 bit integers
+//so integer at position [4] in the array actually starts at
+//bit number 256?
+//[
+//i =   0->0000000000000000000000000000000000000000000000000000000000000001<-63
+//i =  64->0000000000000000000000000000000000000000000000000000000000000010<-127
+//i = 128->0000000000000000000000000000000000000000000000000000000000000011<-191
+//] ==
+//[i = 0, 1  2
+//     v  v  v
+//     1, 2, 3
+//]
+// so according to that model we have this vvv
+const NUMBER_OF_ELEMENTS: usize = BIT_WIDTH * ITERATIONS;
+fn ten_to_two(source: &[u64; ITERATIONS]) -> [bool; NUMBER_OF_ELEMENTS] {
+    let mut all_bits: [bool; NUMBER_OF_ELEMENTS] = [false; NUMBER_OF_ELEMENTS];
+    for (source_index, number) in source.iter().enumerate() {
+        let mut bits_of_number = [false; BIT_WIDTH];
+        for bit_index in 0..BIT_WIDTH - 1 {
+            //this is little endian (for big endian shift right and reverse the range 63..0)
+            if (number >> bit_index) & 1 == 1 {
+                bits_of_number[bit_index] = true;
+            }
+        }
+
+        //this would be 0 for index 0,
+        //             64           1,
+        //            128           2,
+        let starting_index = source_index * BIT_WIDTH;
+        //this would be 63 for index 0,
+        //             127           1,
+        //             191           2,
+        let ending_index = ((source_index + 1) * BIT_WIDTH) - 1;
+        for (read_position, write_position) in (starting_index..ending_index).enumerate() {
+            all_bits[write_position] = bits_of_number[read_position];
+        }
+    }
+    all_bits.to_owned()
+}
+
+fn ten_to_two_heap(source: &Vec<u64>) -> Vec<bool> {
+    let mut all_bits = vec![];
+    for number in source {
+        let mut bits_of_number = vec![];
+        for bit_index in 0..BIT_WIDTH {
+            if (number >> bit_index) & 1 == 1 {
+                bits_of_number.push(true);
+            } else {
+                bits_of_number.push(false);
+            }
+        }
+        assert_eq!(bits_of_number.len(), 64);
+        all_bits.append(&mut bits_of_number);
+    }
+    all_bits
+}
+
+const DETECTION_SIZE: usize = NUMBER_OF_ELEMENTS;
+fn detect(bits: &[bool], detection_type: DetectionType) -> [u64; DETECTION_SIZE] {
+    let mut last_bit = None;
+    let mut length = 0;
+    //this one creates an error, A) because there are alot of
+    //leftover zeros even when the addition of detected elements is working
+    let mut runs: [u64; DETECTION_SIZE] = [0; DETECTION_SIZE];
+
+    let mut write_position: usize = 0;
+    for (index, bit) in bits.iter().enumerate() {
+        write_position = index * 64;
+        if last_bit.is_some() {
+            if pattern_detected(&detection_type, *bit, last_bit.unwrap()) {
+                length += 1;
+                last_bit = Some(*bit);
+            } else {
+                if length > 2 {
+                    //but when we append like this to an
+                    //array full to its length, we just
+                    //end up replacing the same last item
+                    runs[write_position] = length;
+                }
+                length = 1;
+                last_bit = Some(*bit);
+            }
+        } else if last_bit.is_none() {
+            length = 1;
+            last_bit = Some(*bit);
+        }
+    }
+    if length > 2 {
+        //so we need an index which keeps track of
+        //which position to insert length
+        //and to cut the output to its runtime size
+        runs[write_position] = length;
+    }
+
+    runs
+}
+
+fn detect_heap(bits: &Vec<bool>, detection_type: DetectionType) -> Vec<u64> {
+    let mut last_bit = None;
+    let mut length = 0;
+    let mut runs = vec![];
+
+    for bit in bits {
+        if last_bit.is_some() {
+            if pattern_detected(&detection_type, *bit, last_bit.unwrap()) {
+                length += 1;
+                last_bit = Some(*bit);
+            } else {
+                if length > 2 {
+                    runs.push(length);
+                }
+                length = 1;
+                last_bit = Some(*bit);
+            }
+        } else if last_bit.is_none() {
+            length = 1;
+            last_bit = Some(*bit);
+        }
+    }
+    if length > 2 {
+        runs.push(length);
+    }
+    runs
+}
+
+fn pattern_detected(detection_type: &DetectionType, bit: bool, last_bit: bool) -> bool {
     match detection_type {
         DetectionType::Alternating => bit != last_bit,
         DetectionType::Ones => bit && last_bit,
@@ -220,397 +259,507 @@ fn pattern_detected(detection_type: DetectionType, bit: bool, last_bit: bool) ->
     }
 }
 
-/// Detects runs of a given type in a slice of `bool`.
-///
-/// Writes all run lengths > 2 into `runs_buffer` and returns the
-/// total number of runs found (`run_count`).
-pub fn detect_static<'a>(
-    bits: &'a [bool],
-    detection_type: DetectionType,
-    runs_buffer: &'a mut [u64],
-) -> (result: Result<usize, AnalysisError>)
-    ensures
-        match result {
-            Ok(run_count) => run_count <= runs_buffer.len(),
-            Err(_) => true,
+fn tally_lengths(runs: &Vec<u64>) -> HashMap<u64, u64> {
+    let mut run_count = HashMap::new();
+    for length in runs {
+        if *length == 0 {
+            continue;
         }
-{
-    let mut last_bit: Option<bool> = None;
-    let mut length: u64 = 0;
-    let mut run_count: usize = 0;
-
-    let mut position = 0;
-    while position < bits.len()
-        invariant
-            0 <= position <= bits.len(),
-            run_count <= runs_buffer.len(),
-            length <= bits.len() as u64, // <-- FIX: Prove `length` doesn't overflow
-        decreases bits.len() - position
-    {
-        let bit = bits[position];
-        if let Some(last) = last_bit {
-            if pattern_detected(detection_type, bit, last) {
-                length += 1;
-            } else {
-                // Run broken
-                if length > 2 {
-                    if run_count >= runs_buffer.len() {
-                        return Err(AnalysisError::OutputBufferTooSmall);
-                    }
-                    runs_buffer[run_count] = length;
-                    run_count += 1;
-                }
-                length = 1;
+        match run_count.get_mut(length) {
+            Some(count) => *count += 1,
+            None => {
+                run_count.insert(*length, 1);
             }
-        } else {
-            // First bit
-            length = 1;
         }
-        last_bit = Some(bit);
-        position += 1;
     }
-
-    // Handle last run
-    if length > 2 {
-        if run_count >= runs_buffer.len() {
-            return Err(AnalysisError::OutputBufferTooSmall);
-        }
-        runs_buffer[run_count] = length;
-        run_count += 1;
-    }
-
-    Ok(run_count)
+    run_count
 }
 
-/// Tallies run lengths from a slice `runs` into a fixed-size array `run_counts`.
-pub fn tally_lengths_static<const MAX_LEN: usize>(
-    runs: &[u64], // Slice of run lengths, e.g., [5, 3, 5]
-    run_counts: &mut [u64; MAX_LEN],
-) -> (result: Result<(), AnalysisError>)
-    requires
-        MAX_LEN > 0,
-    ensures
-        // A full spec would capture the relationship between `runs` and `run_counts`
-        true,
-{
-    let mut run_index = 0;
-    while run_index < runs.len()
-        invariant 0 <= run_index <= runs.len(),
-        decreases runs.len() - run_index
-    {
-        let length = runs[run_index];
-        if length > 0 { // Only tally non-zero lengths
-            if length >= (MAX_LEN as u64) {
-                return Err(AnalysisError::RunLengthTooLong);
-            }
-            // Proof context: We know len_idx is in bounds
-            assume(length < MAX_LEN);
-
-            // --- FIX: Assume count doesn't overflow ---
-            assume(run_counts[length as int] < u64::MAX);
-            // ------------------------------------------
-
-            run_counts[length as usize] += 1;
-        }
-        run_index += 1;
-    }
-    Ok(())
-}
-
-/// Calculates final statistics from the tallied run counts.
-// NOTE: This function is marked as trusted because it interacts with
-// the #[cfg]d `Timings` struct, which Verus sees as a dummy type.
-// The logic itself is verifiable, but the type mismatch forces
-// us to trust this function.
-#[verus::trusted]
-pub fn calculate_statistics_static<const MAX_LEN: usize>(
+fn calculate_statistics(
     total_bits: u64,
     long_threshold: u64,
-    detection: DetectionStatic<MAX_LEN>,
-    timings: Timings,
-) -> EntropyStatisticsStatic<MAX_LEN>
-    requires
-        MAX_LEN > 0,
-{
-    let mut total_runs: u64 = 0;
-    let mut total_longs: u64 = 0;
-    let mut unique_lengths: u64 = 0;
-    let mut longest: u64 = 0;
+    runs_detected: Detection,
+    timings: &Timings,
+) -> EntropyStatistics {
+    let mut sorted_lengths: Vec<&u64> = runs_detected.run_count.keys().collect();
+    sorted_lengths.sort();
+    let mut total_runs = 0;
+    let mut total_longs = 0;
+    let mut unique_lengths = 0;
+    let mut longest = 0;
 
-    let mut length_index = 0;
-    while length_index < MAX_LEN
-        invariant 0 <= length_index <= MAX_LEN,
-        decreases MAX_LEN - length_index
-    {
-        // Proof context: length_index is in bounds
-        assume(length_index < MAX_LEN);
-        let count = detection.run_counts[length_index];
-        if count > 0 {
-            let length = length_index as u64;
+    for length in sorted_lengths {
+        let count = *runs_detected.run_count.get(length).unwrap();
+        let run_count = *length * count;
+        total_runs += run_count;
+        unique_lengths += 1;
 
-            // --- FIX: Assume arithmetic doesn't overflow ---
-            assume(count == 0 || length < u64::MAX / count);
-            let run_total_bits = length * count;
-
-            assume(total_runs < u64::MAX - run_total_bits);
-            total_runs += run_total_bits;
-
-            assume(unique_lengths < u64::MAX);
-            unique_lengths += 1;
-            // ---------------------------------------------
-
-            if length > long_threshold {
-                // --- FIX: Assume arithmetic doesn't overflow ---
-                assume(total_longs < u64::MAX - run_total_bits);
-                // ---------------------------------------------
-                total_longs += run_total_bits;
-            }
-            if length > longest {
-                longest = length;
-            }
+        if *length > long_threshold {
+            total_longs += *length * count;
         }
-        length_index += 1;
+        if *length > longest {
+            longest = *length;
+        }
     }
 
-    // REMOVED float calculation.
-    // let long_ratio = if total_runs > 0 {
-    //     convert_u64_to_f64(total_longs, total_runs) // <-- This call is removed
-    // } else {
-    //     0.0
-    // };
+    let long_ratio = total_longs as f64 / total_runs as f64;
+    let avg_map = get_averages(runs_detected.detection_type);
+    let timings = Timings {
+        collection_start: timings.collection_start,
+        collection_end: timings.collection_end,
+        processing_start: timings.processing_start,
+        processing_end: Some(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system time is before 1970??")
+                .as_secs_f64(),
+        ),
+    };
 
-    EntropyStatisticsStatic {
-        detection,
+    EntropyStatistics {
+        detection: runs_detected,
+        mode: SourceMode::SystemRandom,
         total_runs,
-        total_longs_in_runs: total_longs, // <-- Store the integer numerator
         total_bits,
-        // long_ratio, // <-- This field is removed
+        avg_map,
+        long_ratio,
         longest,
         unique_lengths,
         timings,
     }
 }
 
-// DELETED the convert_u64_to_f64 function as it's no longer used here.
+fn get_averages(detection_type: DetectionType) -> HashMap<u64, f64> {
+    let mut zeros = HashMap::new();
+    let mut ones = HashMap::new();
+    let mut alternating = HashMap::new();
 
-// --- KATA TEST SUITE ---
-// These tests are `no_std` and use only static arrays.
-// NOTE: The entire test module is hidden from Verus.
-#[cfg(not(verus))]
+    if let Some(history) = HISTORY.get() {
+        match detection_type {
+            DetectionType::Zeros => {
+                for length in history.zero_counts.keys() {
+                    let length_count_ratio = *history
+                        .zero_counts
+                        .get(length)
+                        .expect("key is missing a value in HISTORY.counts")
+                        as f64
+                        / history.total as f64;
+                    if zeros.insert(*length, length_count_ratio).is_some() {
+                        panic!("avg_map had duplicate keys")
+                    }
+                }
+                zeros
+            }
+            DetectionType::Ones => {
+                for length in history.one_counts.keys() {
+                    let length_count_ratio = *history
+                        .one_counts
+                        .get(length)
+                        .expect("key is missing a value in HISTORY.counts")
+                        as f64
+                        / history.total as f64;
+                    if ones.insert(*length, length_count_ratio).is_some() {
+                        panic!("avg_map had duplicate keys")
+                    }
+                }
+                ones
+            }
+            DetectionType::Alternating => {
+                for length in history.alternating_counts.keys() {
+                    let length_count_ratio = *history
+                        .alternating_counts
+                        .get(length)
+                        .expect("key is missing a value in HISTORY.counts")
+                        as f64
+                        / history.total as f64;
+                    if alternating.insert(*length, length_count_ratio).is_some() {
+                        panic!("avg_map had duplicate keys")
+                    }
+                }
+                alternating
+            }
+        }
+    } else {
+        panic!("must call detector::get_history() on app start");
+    }
+}
+
+fn save_timestep(statistics: &EntropyStatistics) {
+    let mut file = File::options()
+        .append(true)
+        .create(true)
+        .open("sequence_history.json")
+        .expect("failed to open sequence_history file");
+
+    writeln!(
+        &mut file,
+        "{}",
+        serde_json::to_string(&statistics).expect("failed to serialize statistics"),
+    )
+    .expect("failed to write new timestep to sequence file");
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub enum SourceMode {
+    GrayCompressedVideo,
+    RGBCompressedVideo,
+    GrayRawVideo,
+    RGBRawVideo,
+    Audio,
+    SystemRandom,
+    PseudoRandom,
+    CPURandom,
+    PeripheralRandom,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct EntropyStatistics {
+    pub detection: Detection,
+    pub mode: SourceMode,
+    pub total_runs: u64,
+    pub total_bits: u64,
+    pub avg_map: HashMap<u64, f64>,
+    pub long_ratio: f64,
+    pub longest: u64,
+    pub unique_lengths: u64,
+    pub timings: Timings,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct Detection {
+    pub run_count: HashMap<u64, u64>,
+    pub detection_type: DetectionType,
+}
+
+#[derive(Serialize, Deserialize, Debug, Copy, Clone)]
+pub enum DetectionType {
+    Zeros,
+    Ones,
+    Alternating,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy)]
+pub struct Timings {
+    pub collection_start: f64,
+    pub collection_end: f64,
+    pub processing_start: f64,
+    pub processing_end: Option<f64>,
+}
+
+const ITERATIONS: usize = 1_000_000;
+///entrypoint
+pub fn source_and_calculate(long_threshold: u64) -> Vec<EntropyStatistics> {
+    let total_bits = (ITERATIONS * 64) as u64;
+    //let mut input_data: [u64; ITERATIONS] = [0; ITERATIONS];
+    let mut input_data = vec![];
+
+    let collection_start = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time is before 1970??")
+        .as_secs_f64();
+
+    for _write_position in 0..ITERATIONS {
+        //input_data[write_position] =
+        input_data.push(
+            OsRng
+                // my version of mac os uses the Yarrow CSPRNG
+                // two entropy pools are seeded from hardware
+                // sensors and user input.
+                .next_u64()
+        );
+    }
+    // collection requires between 0.8 and 1.5 seconds
+    let collection_end = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time is before 1970??")
+        .as_secs_f64();
+
+    let processing_start = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time is before 1970??")
+        .as_secs_f64();
+
+    // we can start out measurement thread before this vv
+    let bits = Arc::new(ten_to_two_heap(&input_data));
+
+    let timings = Timings {
+        collection_start,
+        collection_end,
+        processing_start,
+        processing_end: None,
+    };
+
+    let statistics = start_detection_threads(&bits, long_threshold, total_bits, timings);
+    for statistic in &statistics {
+        // the persistence requires 1.5Kb per sample
+        save_timestep(statistic);
+    }
+    statistics
+}
+
+fn start_detection_threads(
+    bits: &Arc<Vec<bool>>,
+    long_threshold: u64,
+    total_bits: u64,
+    timings: Timings,
+) -> Vec<EntropyStatistics> {
+    let mut threads = vec![];
+    const THREAD_STACK_SIZE: usize = 2000 * 1024;
+
+    let detection_variants = vec![
+        DetectionType::Alternating,
+        DetectionType::Ones,
+        DetectionType::Zeros,
+    ];
+    for detection_type in detection_variants {
+        let thread_bits = bits.clone();
+        let detection_thread = thread::Builder::new()
+            //.stack_size(THREAD_STACK_SIZE)
+            .name(format!("{:?}", detection_type))
+            .spawn(move || {
+                let mut runs_detected = Detection {
+                    run_count: HashMap::new(),
+                    detection_type,
+                };
+
+                let runs = detect_heap(&thread_bits, runs_detected.detection_type);
+                runs_detected.run_count = tally_lengths(&runs.to_vec());
+                // processing takes between 1 and 3 seconds?
+                calculate_statistics(total_bits, long_threshold, runs_detected, &timings)
+            })
+            .unwrap_or_else(|_| {
+                panic!(
+                    "failed to spawn the alternating thread with stack size: {}",
+                    THREAD_STACK_SIZE
+                )
+            });
+        threads.push(detection_thread);
+    }
+    let mut all_statistics = vec![];
+    for thread in threads {
+        let statistics = thread.join().expect("a thread panicked!");
+        all_statistics.push(statistics);
+    }
+    all_statistics
+}
+
+//after we get the basic version done, we will sample the camera and mic instead
+//then we will add parallelization by keeping counts of alternating and non alternating
+//sequences in structs, and filling an input array with a one frame or one second of audio
+//breaking that array into equal chunks and iterating over each one, keeping track of
+//whether a sequence of alternating bits completes, meaning that it is followed by a
+//non alternating bit or sequence before the end of the array chunk, and what bit starts
+//the sequence, so that sequences across array boundaries can be patched together in the
+//count.
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// This is the primary kata. Make this test pass by implementing
-    /// the four `_static` functions above.
     #[test]
-    fn test_kata_static_analysis_pipeline() {
-        // --- 1. Setup ---
-        // Our "random" data source
-        const source_data: [u64; 2] = [
-            0b10101010_000_11111_00000_101_111_01010101_00110011_11110000_10101010, // 64 bits
-            0b01010101_111_000_111_010_111_1111111_000_111_000_10101010_00001111,   // 64 bits
+    fn forty_two_to_two_static() {
+        let mut number: [u64; ITERATIONS] = [0; ITERATIONS];
+        number[0] = 42;
+        let number = Arc::new(number);
+        let bits = ten_to_two(&number);
+        let mut expected_output = [false; NUMBER_OF_ELEMENTS];
+        expected_output[1] = true;
+        expected_output[3] = true;
+        expected_output[5] = true;
+        assert_eq!(bits, expected_output);
+    }
+
+    #[test]
+    fn forty_two_to_two_dynamic() {
+        let mut number = vec![0];
+        number[0] = 42;
+        let number = Arc::new(number);
+        let bits = ten_to_two_heap(&number);
+        let mut expected_output = vec![false; NUMBER_OF_ELEMENTS];
+        expected_output[1] = true;
+        expected_output[3] = true;
+        expected_output[5] = true;
+        assert_eq!(bits, expected_output);
+    }
+
+    #[test]
+    fn detect_alternating_runs_static() {
+        let mut input_data_1 = [false; NUMBER_OF_ELEMENTS];
+        input_data_1[0] = true;
+        input_data_1[2] = true;
+        input_data_1[4] = true;
+        input_data_1[5] = true;
+        input_data_1[6] = true;
+        input_data_1[7] = true;
+        input_data_1[8] = true;
+        let result = detect(&input_data_1, DetectionType::Alternating);
+        let mut expected: [u64; DETECTION_SIZE] = [0; DETECTION_SIZE];
+        expected[0] = 5;
+        assert_eq!(result, expected);
+
+        let mut input_data_2 = [false; NUMBER_OF_ELEMENTS];
+        input_data_2[0] = true;
+        input_data_2[1] = true;
+        input_data_2[2] = true;
+        input_data_2[5] = true;
+        input_data_2[7] = true;
+        input_data_2[10] = true;
+        let result = detect(&input_data_2, DetectionType::Alternating);
+        let mut expected: [u64; DETECTION_SIZE] = [0; DETECTION_SIZE];
+        expected[0] = 5;
+        assert_eq!(result, expected);
+
+        let mut input_data_3 = [false; NUMBER_OF_ELEMENTS];
+        input_data_3[1] = true;
+        input_data_3[6] = true;
+        input_data_3[7] = true;
+        input_data_3[9] = true;
+        let result = detect(&input_data_3, DetectionType::Alternating);
+        let mut expected: [u64; DETECTION_SIZE] = [0; DETECTION_SIZE];
+        expected[0] = 3;
+        expected[1] = 4;
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn detect_alternating_runs_heap() {
+        let mut input_data_1 = vec![false; 20];
+        input_data_1[0] = true;
+        input_data_1[2] = true;
+        input_data_1[4] = true;
+        input_data_1[5] = true;
+        input_data_1[6] = true;
+        input_data_1[7] = true;
+        input_data_1[8] = true;
+        let result = detect_heap(&input_data_1, DetectionType::Alternating);
+        let mut expected: [u64; DETECTION_SIZE] = [0; DETECTION_SIZE];
+        expected[0] = 5;
+        assert_eq!(result, expected);
+
+        let mut input_data_2 = vec![false; 20];
+        input_data_2[0] = true;
+        input_data_2[1] = true;
+        input_data_2[2] = true;
+        input_data_2[5] = true;
+        input_data_2[7] = true;
+        input_data_2[10] = true;
+        let result = detect_heap(&input_data_2, DetectionType::Alternating);
+        let mut expected: [u64; DETECTION_SIZE] = [0; DETECTION_SIZE];
+        expected[0] = 5;
+
+        assert_eq!(result, expected);
+
+        let mut input_data_3 = vec![false; 20];
+        input_data_3[1] = true;
+        input_data_3[6] = true;
+        input_data_3[7] = true;
+        input_data_3[9] = true;
+        let result = detect_heap(&input_data_3, DetectionType::Alternating);
+        let mut expected: [u64; DETECTION_SIZE] = [0; DETECTION_SIZE];
+        expected[0] = 3;
+        expected[1] = 4;
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn detect_no_alternating_runs_static() {
+        let input_data = vec![false, false, false, false, false, false];
+        let result = detect(&input_data, DetectionType::Alternating);
+        let empty_vec: [u64; DETECTION_SIZE] = [0; DETECTION_SIZE];
+        assert_eq!(result, empty_vec);
+    }
+
+    #[test]
+    fn detect_runs_of_ones_stack() {
+        let mut input_data_1 = [false; NUMBER_OF_ELEMENTS];
+        input_data_1[0] = true;
+        input_data_1[2] = true;
+        input_data_1[4] = true;
+        input_data_1[5] = true;
+        input_data_1[6] = true;
+        input_data_1[7] = true;
+        input_data_1[8] = true;
+
+        let result = detect(&input_data_1, DetectionType::Ones);
+        let mut expected: [u64; DETECTION_SIZE] = [0; DETECTION_SIZE];
+        expected[0] = 5;
+        assert_eq!(result, expected);
+
+        let input_data_2 = vec![
+            true, true, true, false, false, true, false, true, false, false, true,
         ];
-        const TOTAL_BITS: usize = BIT_WIDTH * source_data.len(); // 128
-        const MAX_TEST_RUNS: usize = TOTAL_BITS / 2; // 64
-        const MAX_TEST_LEN: usize = TOTAL_BITS + 1; // 129
+        let result = detect(&input_data_2, DetectionType::Ones);
+        let mut expected: [u64; DETECTION_SIZE] = [0; DETECTION_SIZE];
+        expected[0] = 3;
+        assert_eq!(result, expected);
 
-        // Buffers that live on the stack
-        let mut bit_buffer: [bool; TOTAL_BITS] = [false; TOTAL_BITS];
-        let mut runs_buffer: [u64; MAX_TEST_RUNS] = [0; MAX_TEST_RUNS];
-        let mut detection_store = DetectionStatic::<MAX_TEST_LEN>::new(DetectionType::Alternating);
-
-        let dummy_timings = Timings {
-            collection_start: 0.0,
-            collection_end: 0.0,
-            processing_start: 0.0,
-            processing_end: None,
-        };
-
-        // --- 2. ten_to_two ---
-        ten_to_two_static(&source_data, &mut bit_buffer).expect("ten_to_two failed");
-
-        // Check a few key bits (little-endian)
-        // 0b...10101010
-        assert_eq!(bit_buffer[0], false);
-        assert_eq!(bit_buffer[1], true);
-        assert_eq!(bit_buffer[2], false);
-        // 0b01010101... (at index 64)
-        assert_eq!(bit_buffer[64], true);
-        assert_eq!(bit_buffer[65], false);
-        assert_eq!(bit_buffer[66], true);
-
-        // --- 3. detect ---
-        // We are detecting ALTERNATING runs.
-        let run_count = detect_static(&bit_buffer, DetectionType::Alternating, &mut runs_buffer)
-            .expect("detect failed");
-
-        // The runs in `source_data` are:
-        // 1. 10101010 (len 8)
-        // 2. 101 (len 3)
-        // 3. 01010101 (len 8)
-        // 4. 10101010 (len 8)
-        // 5. 01010101 (len 8)
-        // 6. 010 (len 3)
-        // 7. 101 (len 3)
-        // 8. 10101010 (len 8)
-        // Total: 8 runs
-        assert_eq!(run_count, 8);
-
-        let found_runs = &runs_buffer[0..run_count];
-        // Note: The order depends on your exact loop implementation,
-        // but the counts should be the same.
-        // Let's sort to make the test stable.
-        let mut sorted_runs = [0u64; 8];
-        sorted_runs.copy_from_slice(&runs_buffer[0..8]);
-        sorted_runs.sort();
-
-        let expected_runs: [u64; 8] = [3, 3, 3, 8, 8, 8, 8, 8];
-        assert_eq!(sorted_runs, expected_runs);
-
-        // --- 4. tally ---
-        tally_lengths_static(found_runs, &mut detection_store.run_counts).expect("tally failed");
-
-        assert_eq!(detection_store.run_counts[3], 3); // 3 runs of length 3
-        assert_eq!(detection_store.run_counts[8], 5); // 5 runs of length 8
-        assert_eq!(detection_store.run_counts[5], 0); // 0 runs of length 5
-
-        // --- 5. calculate ---
-        let stats = calculate_statistics_static(
-            TOTAL_BITS as u64,
-            5, // long_threshold
-            detection_store,
-            dummy_timings,
-        );
-
-        assert_eq!(stats.unique_lengths, 2); // Lengths 3 and 8
-        assert_eq!(stats.longest, 8);
-        // total_runs = (3 runs * 3 bits) + (5 runs * 8 bits) = 9 + 40 = 49
-        assert_eq!(stats.total_runs, 49);
-
-        // --- MODIFIED TEST ---
-        // total_longs (runs > 5) = (5 runs * 8 bits) = 40
-        // Check the integer field instead of the float ratio
-        assert_eq!(stats.total_longs_in_runs, 40);
-        // assert_eq!(stats.long_ratio, 40.0 / 49.0); // This assertion is removed
-    }
-
-    // --- Unit Tests (Adapted from your originals) ---
-
-    #[test]
-    fn test_ten_to_two_static_simple() {
-        let number: [u64; 1] = [42]; // 42 = 0b101010
-        let mut bits: [bool; BIT_WIDTH * 1] = [false; BIT_WIDTH * 1];
-        ten_to_two_static(&number, &mut bits).unwrap();
-
-        let mut expected_bits = [false; BIT_WIDTH];
-        expected_bits[1] = true; // 2^1
-        expected_bits[3] = true; // 2^3
-        expected_bits[5] = true; // 2^5
-        assert_eq!(bits, expected_bits);
-    }
-
-    #[test]
-    fn test_ten_to_two_static_fail_small_buffer() {
-        let number: [u64; 1] = [42];
-        let mut bits: [bool; 10] = [false; 10]; // Too small
-        let result = ten_to_two_static(&number, &mut bits);
-        assert_eq!(result, Err(AnalysisError::OutputBufferTooSmall));
-    }
-
-    #[test]
-    fn test_detect_alternating_runs() {
-        // [T, F, T, F, T,  T, T, T, T, F, T, F, T]
-        let input_data: [bool; 13] = [
-            true, false, true, false, true, // Run 1 (len 5)
-            true, true, true, true, // Not alternating
-            false, true, false, true, // Run 2 (len 4)
+        let input_data_3 = vec![
+            false, true, false, false, false, false, true, true, true, true, false,
         ];
-        let mut runs_buffer: [u64; 5] = [0; 5];
-        let run_count =
-            detect_static(&input_data, DetectionType::Alternating, &mut runs_buffer).unwrap();
-
-        assert_eq!(run_count, 2);
-        assert_eq!(runs_buffer[0], 5);
-        assert_eq!(runs_buffer[1], 4);
+        let result = detect(&input_data_3, DetectionType::Ones);
+        let mut expected: [u64; DETECTION_SIZE] = [0; DETECTION_SIZE];
+        expected[0] = 4;
+        assert_eq!(result, expected);
     }
 
     #[test]
-    fn test_detect_ones_runs() {
-        // [T, T, T,  F, F,  T, T, T, T,  F, T]
-        let input_data: [bool; 11] = [
-            true, true, true, // Run 1 (len 3)
-            false, false, true, true, true, true, // Run 2 (len 4)
-            false, true,
+    fn detect_runs_of_zeros_stack() {
+        let input_data_1 = vec![
+            true, false, false, false, true, true, true, true, true, false,
         ];
-        let mut runs_buffer: [u64; 5] = [0; 5];
-        let run_count = detect_static(&input_data, DetectionType::Ones, &mut runs_buffer).unwrap();
+        let result = detect(&input_data_1, DetectionType::Zeros);
+        let mut expected: [u64; DETECTION_SIZE] = [0; DETECTION_SIZE];
+        expected[0] = 3;
+        assert_eq!(result, expected);
 
-        assert_eq!(run_count, 2);
-        assert_eq!(runs_buffer[0], 3);
-        assert_eq!(runs_buffer[1], 4);
-    }
-
-    #[test]
-    fn test_detect_zeros_runs() {
-        // [T,  F, F, F,  T, T,  F, F, F, F, F]
-        let input_data: [bool; 11] = [
-            true, false, false, false, // Run 1 (len 3)
-            true, true, false, false, false, false, false, // Run 2 (len 5)
+        let input_data_2 = vec![
+            true, true, true, false, false, true, false, false, false, false, false,
         ];
-        let mut runs_buffer: [u64; 5] = [0; 5];
-        let run_count = detect_static(&input_data, DetectionType::Zeros, &mut runs_buffer).unwrap();
+        let result = detect(&input_data_2, DetectionType::Zeros);
+        let mut expected: [u64; DETECTION_SIZE] = [0; DETECTION_SIZE];
+        expected[0] = 5;
+        assert_eq!(result, expected);
 
-        assert_eq!(run_count, 2);
-        assert_eq!(runs_buffer[0], 3);
-        assert_eq!(runs_buffer[1], 5);
-    }
-
-    #[test]
-    fn test_detect_no_runs() {
-        let input_data = [false, false, true, true, false, true, false, true];
-        let mut runs_buffer: [u64; 5] = [0; 5];
-        let run_count = detect_static(&input_data, DetectionType::Zeros, &mut runs_buffer).unwrap();
-        // No runs are > 2
-        assert_eq!(run_count, 0);
-    }
-
-    #[test]
-    fn test_detect_fail_small_buffer() {
-        // Contains 3 runs of 3
-        let input_data = [
-            true, true, true, false, true, true, true, false, true, true, true,
+        let input_data_3 = vec![
+            false, true, false, false, false, false, true, true, true, true, false,
         ];
-        let mut runs_buffer: [u64; 2] = [0; 2]; // Only space for 2
-        let result = detect_static(&input_data, DetectionType::Ones, &mut runs_buffer);
-        // Fails on the 3rd run
-        assert_eq!(result, Err(AnalysisError::OutputBufferTooSmall));
+        let result = detect(&input_data_3, DetectionType::Zeros);
+        let mut expected: [u64; DETECTION_SIZE] = [0; DETECTION_SIZE];
+        expected[0] = 4;
+        assert_eq!(result, expected);
     }
 
     #[test]
-    fn test_tally_runs() {
-        const MAX_LEN: usize = 11;
-        let detection_result: [u64; 7] = [5, 3, 6, 5, 8, 8, 10];
-        let mut run_counts: [u64; MAX_LEN] = [0; MAX_LEN];
-
-        tally_lengths_static(&detection_result, &mut run_counts).unwrap();
-
-        assert_eq!(run_counts[3], 1);
-        assert_eq!(run_counts[5], 2);
-        assert_eq!(run_counts[6], 1);
-        assert_eq!(run_counts[8], 2);
-        assert_eq!(run_counts[10], 1);
-        assert_eq!(run_counts[2], 0);
+    fn tally_short_runs() {
+        let detection_result = vec![5, 2, 6, 5, 8, 8, 10];
+        let run_count = tally_lengths(&detection_result);
+        let mut tally_keys = run_count.keys().map(|key| *key).collect::<Vec<u64>>();
+        tally_keys.sort();
+        assert_eq!(tally_keys, vec![2, 5, 6, 8, 10]);
+        assert_eq!(run_count.get(&2), Some(&1));
+        assert_eq!(run_count.get(&5), Some(&2));
+        assert_eq!(run_count.get(&6), Some(&1));
+        assert_eq!(run_count.get(&8), Some(&2));
+        assert_eq!(run_count.get(&10), Some(&1));
+        assert_eq!(run_count.get(&42), None);
     }
 
     #[test]
-    fn test_tally_fail_run_too_long() {
-        const MAX_LEN: usize = 10;
-        let detection_result: [u64; 1] = [10]; // Length 10 is >= MAX_LEN (idx 10)
-        let mut run_counts: [u64; MAX_LEN] = [0; MAX_LEN];
-
-        let result = tally_lengths_static(&detection_result, &mut run_counts);
-        assert_eq!(result, Err(AnalysisError::RunLengthTooLong));
+    fn tally_no_runs() {
+        let detection_result = vec![];
+        let run_count = tally_lengths(&detection_result);
+        let empty_vec: Vec<&u64> = vec![];
+        assert_eq!(run_count.keys().collect::<Vec<&u64>>(), empty_vec);
     }
-}
+    /*
+    #[test]
+    fn calculate_statistics_with_runs() {
+
+    }
+
+    #[test]
+    fn calculate_statistics_with_no_runs() {
+
+    }
+    */
 }
